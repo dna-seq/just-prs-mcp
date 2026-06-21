@@ -10,13 +10,14 @@ ESSENTIALS = {
     "trait_info",
     "normalize_vcf",
     "compute_prs",
+    "compute_prs_batch",
+    "compute_prs_by_trait",
     "percentile",
     "absolute_risk",
     "assess_quality",
 }
 
 EXTENDED_ONLY = {
-    "compute_prs_batch",
     "normalize_array",
     "download_scoring_file",
     "list_pgs_ids",

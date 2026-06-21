@@ -78,6 +78,10 @@ class NormalizeResult(BaseModel):
 
     output_path: str = Field(description="Path to the normalized Parquet file.")
     n_variants: int = Field(description="Number of variant rows written.")
+    genome_build: str | None = Field(
+        default=None,
+        description="Effective genome build assumed for downstream scoring.",
+    )
     message: str = Field(description="Human-readable summary.")
 
 
@@ -93,6 +97,68 @@ class PercentileResult(BaseModel):
         description="'reference_panel', 'theoretical', 'auroc_approx', or 'unavailable'."
     )
     ancestry: str = Field(description="1000G superpopulation used (AFR/AMR/EAS/EUR/SAS).")
+    reliable: bool = Field(
+        default=True,
+        description="False when the percentile should be treated as caveated or unreliable.",
+    )
+    caveat: str | None = Field(
+        default=None,
+        description="Human-readable warning explaining why the percentile is caveated.",
+    )
+
+
+class TraitSummary(BaseModel):
+    """Compact trait search result for keeping search payloads small."""
+
+    id: str = Field(description="Trait ontology ID, e.g. 'EFO_0001645' or 'MONDO_0005148'.")
+    label: str = Field(description="Trait label.")
+    description: str | None = Field(default=None, description="Trait description, when available.")
+    trait_categories: list[str] = Field(
+        default_factory=list, description="PGS Catalog trait category labels."
+    )
+    trait_synonyms: list[str] = Field(default_factory=list, description="Known trait synonyms.")
+    n_associated: int = Field(description="Number of directly associated PGS IDs.")
+    n_child_associated: int = Field(description="Number of PGS IDs associated via child traits.")
+
+
+class TraitScoreRow(BaseModel):
+    """One score row in a trait-level PRS report."""
+
+    pgs_id: str = Field(description="PGS Catalog Score ID.")
+    status: str = Field(description="'scored' or 'failed'.")
+    score: float | None = Field(default=None, description="Computed PRS value.")
+    variants_matched: int | None = Field(default=None, description="Matched scoring variants.")
+    variants_total: int | None = Field(default=None, description="Total scoring variants.")
+    match_rate: float | None = Field(default=None, description="Matched / total scoring variants.")
+    percentile: float | None = Field(default=None, description="Optional percentile estimate.")
+    percentile_method: str | None = Field(default=None, description="Method used for percentile.")
+    percentile_reliable: bool | None = Field(
+        default=None, description="Reliability flag from percentile estimation."
+    )
+    percentile_caveat: str | None = Field(
+        default=None, description="Warning attached to the percentile estimate."
+    )
+    quality_label: str | None = Field(default=None, description="Optional quality label.")
+    quality_summary: str | None = Field(default=None, description="Optional quality summary.")
+    effect_size: str | None = Field(
+        default=None, description="Formatted best performance effect size."
+    )
+    auroc_estimate: float | None = Field(default=None, description="Best available AUROC estimate.")
+    error: str | None = Field(default=None, description="Error for failed score rows.")
+
+
+class TraitPRSReport(BaseModel):
+    """Aggregate result for computing many PRS scores associated with one trait."""
+
+    trait_id: str = Field(description="Trait ontology ID used for lookup.")
+    label: str = Field(description="Trait label.")
+    genome_build: str = Field(description="Effective genome build used for scoring.")
+    n_requested: int = Field(description="Number of PGS IDs selected for scoring.")
+    n_scored: int = Field(description="Number of scores computed successfully.")
+    n_failed: int = Field(description="Number of scores that failed.")
+    n_skipped: int = Field(description="Number of associated PGS IDs skipped by the limit.")
+    rows: list[TraitScoreRow] = Field(description="Per-score results.")
+    summary: str = Field(description="Human-readable summary.")
 
 
 class QualityAssessment(BaseModel):

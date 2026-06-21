@@ -1,8 +1,8 @@
 """EXTENDED — heavier / opt-in tools (registered only when mode == "extended").
 
-Batch PRS, consumer-array normalization, scoring-file and bulk catalog downloads,
-and the HuggingFace catalog upload. Long-running operations run as background
-tasks; download/upload tools return a typed ``OpResult`` so partial-success and
+Consumer-array normalization, scoring-file and bulk catalog downloads, and the
+HuggingFace catalog upload. Long-running operations run as background tasks;
+download/upload tools return a typed ``OpResult`` so partial-success and
 missing-credential states are data, not exceptions.
 
 Opt in via ``PRS_MCP_MODE=extended`` / ``--mode extended``.
@@ -20,7 +20,7 @@ from mcp.types import ToolAnnotations
 
 from just_prs_mcp import client
 from just_prs_mcp.logging_setup import get_logger
-from just_prs_mcp.models import NormalizeResult, OpResult, PRSResult
+from just_prs_mcp.models import NormalizeResult, OpResult
 from just_prs_mcp.settings import Settings
 
 log = get_logger()
@@ -34,34 +34,6 @@ def _count_rows(parquet_path: Path) -> int:
 
 def register_extended(mcp: FastMCP, settings: Settings) -> None:
     """Register the extended-only tools."""
-
-    @mcp.tool(
-        task=True,
-        tags={"extended"},
-        annotations=ToolAnnotations(title="Compute PRS (batch)", readOnlyHint=True),
-    )
-    async def compute_prs_batch(
-        vcf_path: str,
-        pgs_ids: list[str],
-        ctx: Context,
-        genome_build: str | None = None,
-    ) -> list[PRSResult]:
-        """Compute PRS for one VCF against many PGS scores (background task).
-
-        Memory-safe DuckDB engine with spill-to-disk; reuses the parsed VCF and
-        scoring caches across scores. Returns one result per PGS ID.
-        """
-        b = client.build(settings, genome_build)
-        cat = client.make_catalog(settings)
-        if not Path(vcf_path).expanduser().exists():
-            raise ToolError(f"VCF not found: {vcf_path}")
-
-        await ctx.info(f"Batch-scoring {len(pgs_ids)} PGS IDs against {Path(vcf_path).name}")
-        results = await run_sync(
-            lambda: cat.compute_prs_batch(vcf_path=vcf_path, pgs_ids=pgs_ids, genome_build=b)
-        )
-        await ctx.info(f"Computed {len(results)} score(s)")
-        return results
 
     @mcp.tool(
         task=True,

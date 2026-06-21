@@ -11,6 +11,8 @@ unavailability surfaces as a ``ToolError`` with the underlying reason.
 
 from __future__ import annotations
 
+import re
+
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -21,6 +23,7 @@ from just_prs_mcp.models import (
     PerformanceSummary,
     ScoreSummary,
     TraitInfo,
+    TraitSummary,
 )
 from just_prs_mcp.settings import Settings
 
@@ -41,6 +44,64 @@ def _score_summary(row: dict) -> ScoreSummary:
         is_harmonized=row.get("is_harmonized"),
         quality_label=row.get("quality_label"),
     )
+
+
+def _trait_text(value: TraitInfo) -> str:
+    parts = [value.id, value.label, value.description or "", *value.trait_synonyms]
+    return " ".join(parts).lower()
+
+
+def _normalized_tokens(term: str) -> list[str]:
+    return [token for token in re.split(r"[^a-z0-9]+", term.lower()) if token]
+
+
+def _trait_matches_tokens(value: TraitInfo, tokens: list[str]) -> bool:
+    text = re.sub(r"[^a-z0-9]+", " ", _trait_text(value))
+    return all(token in text for token in tokens)
+
+
+def _trait_summary(value: TraitInfo) -> TraitSummary:
+    return TraitSummary(
+        id=value.id,
+        label=value.label or value.id,
+        description=value.description,
+        trait_categories=value.trait_categories,
+        trait_synonyms=value.trait_synonyms,
+        n_associated=len(value.associated_pgs_ids),
+        n_child_associated=len(value.child_associated_pgs_ids),
+    )
+
+
+def _trait_search_terms(term: str) -> list[str]:
+    tokens = _normalized_tokens(term)
+    candidates = [term.strip()]
+    type_match = re.search(r"\btype\s+(\d+)\b", term, flags=re.IGNORECASE)
+    if type_match:
+        type_text = type_match.group(0).lower()
+        without_type = re.sub(r"\btype\s+\d+\b", "", term, flags=re.IGNORECASE).strip(" ,")
+        if without_type:
+            candidates.append(f"{without_type}, {type_text}")
+            candidates.append(f"{type_text} {without_type}")
+    if len(tokens) > 1:
+        candidates.extend(tokens)
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def _search_traits_forgiving(rest, term: str, limit: int) -> list[TraitInfo]:
+    results = rest.search_traits(term, limit=limit)
+    if results:
+        return results
+
+    tokens = _normalized_tokens(term)
+    seen: dict[str, TraitInfo] = {}
+    for candidate in _trait_search_terms(term)[1:]:
+        candidate_results = rest.search_traits(candidate, limit=max(limit, 100))
+        for value in candidate_results:
+            if not tokens or _trait_matches_tokens(value, tokens):
+                seen[value.id] = value
+        if len(seen) >= limit:
+            break
+    return list(seen.values())[:limit]
 
 
 def register_catalog(mcp: FastMCP, settings: Settings) -> None:
@@ -108,19 +169,35 @@ def register_catalog(mcp: FastMCP, settings: Settings) -> None:
         )
 
     @mcp.tool(annotations=ToolAnnotations(title="Search traits", **_READ_ONLY))
-    def search_traits(term: str, limit: int = 25) -> list[TraitInfo]:
-        """Search the PGS Catalog REST API for traits by term (e.g. 'type 2 diabetes')."""
+    def search_traits(
+        term: str,
+        limit: int = 25,
+        include_pgs_ids: bool = False,
+    ) -> list[TraitSummary] | list[TraitInfo]:
+        """Search the PGS Catalog REST API for traits by term.
+
+        Upstream matching is exact-substring over labels and synonyms, so this
+        wrapper retries a few punctuation/order variants when the first query is
+        empty. By default, results include counts of directly associated PGS IDs
+        and child-trait PGS IDs; set ``include_pgs_ids`` for the full arrays.
+        """
         try:
             with client.make_rest_client() as rest:
-                return rest.search_traits(term, limit=limit)
+                results = _search_traits_forgiving(rest, term, limit)
         except Exception as exc:  # noqa: BLE001
             raise ToolError(f"Trait search failed: {exc}") from exc
+        if include_pgs_ids:
+            return results
+        return [_trait_summary(value) for value in results]
 
     @mcp.tool(annotations=ToolAnnotations(title="Trait info", **_READ_ONLY))
-    def trait_info(efo_id: str) -> TraitInfo:
-        """Fetch a trait by EFO ID (e.g. 'EFO_0001645') with its associated PGS IDs."""
+    def trait_info(trait_id: str | None = None, efo_id: str | None = None) -> TraitInfo:
+        """Fetch a trait by ontology ID (EFO or MONDO) with its associated PGS IDs."""
+        resolved_id = trait_id or efo_id
+        if resolved_id is None:
+            raise ToolError("Provide trait_id (preferred) or efo_id.")
         try:
             with client.make_rest_client() as rest:
-                return rest.get_trait(efo_id)
+                return rest.get_trait(resolved_id)
         except Exception as exc:  # noqa: BLE001
             raise ToolError(f"Trait lookup failed: {exc}") from exc

@@ -49,7 +49,8 @@ uv run fastmcp dev fastmcp.json      # MCP Inspector (interactive)
 ## The mode axis (the core pattern)
 
 **Mode (essentials vs extended)** controls which tools *exist*.
-- Essentials (`tools/catalog.py`, `tools/compute.py`) are registered in **every** mode.
+- Essentials (`tools/catalog.py`, `tools/compute.py`) are registered in **every** mode,
+  including single-score, batch, and by-trait PRS computation.
 - Extended (`tools/extended.py`, `tools/reference.py`) are registered **only**
   when `mode == "extended"` (`PRS_MCP_MODE` or `--mode`).
 - Why: a smaller default tool list = less context pollution for the agent. The
@@ -97,11 +98,24 @@ round-trip `@pytest.mark.network`.
 
 ## Background tasks
 
-Slow tools (`normalize_vcf`, `compute_prs_batch`, the download tools, reference
-scoring) are real MCP background tasks (`@mcp.tool(task=True)`): the client gets a
-task id immediately, polls, and receives the result when done. Powered by the
-`fastmcp[tasks]` extra; default backend is in-memory (`memory://` — no Redis).
-Set `FASTMCP_DOCKET_URL=redis://...` for distributed/persistent tasks.
+Slow tools (`normalize_vcf`, `compute_prs_batch`, `compute_prs_by_trait`, the
+download tools, reference scoring) are real MCP background tasks
+(`@mcp.tool(task=True)`). Some clients expose the task id and polling directly;
+others transparently collapse that handshake and return the final result inline.
+Powered by the `fastmcp[tasks]` extra; default backend is in-memory (`memory://` —
+no Redis). Set `FASTMCP_DOCKET_URL=redis://...` for distributed/persistent tasks.
+
+## Known issues & deferred fixes
+
+- `docs/dogfooding.md` — running log of quirks/bugs/UX gaps found by dogfooding
+  the server end-to-end (each finding `F#` has repro, severity, and a fix with
+  code pointers). Read it before touching the tool surface.
+- `docs/just-prs-pending-fixes.md` — the subset of those findings that need an
+  **upstream `just-prs` library** change (or real-data verification) before the
+  wrapper can fully resolve them; each notes the defensive wrapper mitigation
+  already in place. Add new upstream-blocked items here, not just in code TODOs.
+  Current priority: **F15** (genome-wide scores match only ~50% of a full WGS
+  callset — harmonization/variant-matching audit).
 
 ## Optional extras
 
