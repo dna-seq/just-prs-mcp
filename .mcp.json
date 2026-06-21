@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cake": {
+      "command": "uv",
+      "args": ["run", "mcp-template", "stdio"],
+      "env": {
+        "CAKE_MODE": "essentials"
+      }
+    }
+  }
+}

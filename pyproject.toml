@@ -1,0 +1,67 @@
+[project]
+name = "mcp-template"
+version = "0.1.0"
+description = "A uv + FastMCP server template (skeleton, patterns, and glue) — cake-themed demo tools"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Your Name", email = "you@example.com" }]
+keywords = ["mcp", "fastmcp", "template", "agent", "llm"]
+
+dependencies = [
+    # `tasks` extra enables real MCP background tasks (@mcp.tool(task=True)).
+    # Default backend is in-memory (memory://) — zero config, no Redis needed.
+    # Set FASTMCP_DOCKET_URL=redis://... only for distributed/persistent tasks.
+    "fastmcp[tasks]>=3.4.2",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "typer>=0.16",
+    "anyio>=4",
+]
+
+[project.optional-dependencies]
+# Optional cloud deployment glue. `uv sync --extra smithery` to enable.
+smithery = ["smithery>=0.4.2"]
+
+[project.scripts]
+# Primary entrypoint. Subcommands: main | stdio | http | sse  (run `mcp-template --help`).
+mcp-template = "mcp_template.server:cli_app"
+
+[build-system]
+requires = ["uv_build>=0.8.15,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.smithery]
+# Optional: Smithery cloud deployment. Function returns a fresh FastMCP server.
+server = "mcp_template.server:start_mcp_smithery"
+log_level = "warning"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    # Benign deprecation emitted inside opentelemetry (a transitive dep of
+    # fastmcp + pydocket), not our code. Remove once upstream updates.
+    "ignore:SelectableGroups dict interface is deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"

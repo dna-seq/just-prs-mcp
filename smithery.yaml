@@ -1,0 +1,4 @@
+# Optional: Smithery cloud deployment (https://smithery.ai).
+# The server entrypoint is set in pyproject.toml under [tool.smithery].
+# No API key is required at boot — keys are injected per request.
+runtime: "python"
