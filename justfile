@@ -27,11 +27,11 @@ types:
 
 # Run the server over stdio (default transport for local MCP clients).
 run mode="essentials":
-    CAKE_MODE={{mode}} uv run mcp-template stdio
+    PRS_MCP_MODE={{mode}} uv run just-prs-mcp stdio
 
 # Run over HTTP.
 serve mode="essentials" port="3011":
-    CAKE_MODE={{mode}} uv run mcp-template http --port {{port}}
+    PRS_MCP_MODE={{mode}} uv run just-prs-mcp http --port {{port}}
 
 # Open the MCP Inspector (interactive dev UI).
 dev:

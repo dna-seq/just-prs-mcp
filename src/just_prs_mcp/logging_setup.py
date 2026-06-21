@@ -13,9 +13,9 @@ from __future__ import annotations
 import logging
 import sys
 
-from mcp_template.settings import Settings
+from just_prs_mcp.settings import Settings
 
-LOGGER_NAME = "mcp_template"
+LOGGER_NAME = "just_prs_mcp"
 _CONFIGURED = False
 
 
@@ -26,9 +26,7 @@ def setup_logging(settings: Settings | None = None) -> logging.Logger:
     logger = logging.getLogger(LOGGER_NAME)
     if not _CONFIGURED:
         handler = logging.StreamHandler(sys.stderr)  # stderr — never stdout
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logger.addHandler(handler)
         logger.propagate = False
         _CONFIGURED = True

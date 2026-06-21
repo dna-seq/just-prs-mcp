@@ -1,10 +1,10 @@
 {
   "mcpServers": {
-    "cake": {
+    "just-prs": {
       "command": "uv",
-      "args": ["run", "mcp-template", "stdio"],
+      "args": ["run", "just-prs-mcp", "stdio"],
       "env": {
-        "CAKE_MODE": "essentials"
+        "PRS_MCP_MODE": "essentials"
       }
     }
   }

@@ -10,9 +10,9 @@ COPY . .
 # Install only runtime deps into a project venv.
 RUN uv sync --no-dev
 
-ENV CAKE_TRANSPORT=http \
-    CAKE_HOST=0.0.0.0 \
-    CAKE_PORT=3011
+ENV PRS_MCP_TRANSPORT=http \
+    PRS_MCP_HOST=0.0.0.0 \
+    PRS_MCP_PORT=3011
 EXPOSE 3011
 
-CMD ["uv", "run", "mcp-template", "http", "--host", "0.0.0.0", "--port", "3011"]
+CMD ["uv", "run", "just-prs-mcp", "http", "--host", "0.0.0.0", "--port", "3011"]

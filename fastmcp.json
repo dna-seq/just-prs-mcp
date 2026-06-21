@@ -1,7 +1,7 @@
 {
   "$schema": "https://gofastmcp.com/public/schemas/fastmcp.json/v1.json",
   "source": {
-    "path": "src/mcp_template/server.py",
+    "path": "src/just_prs_mcp/server.py",
     "entrypoint": "mcp"
   },
   "environment": {
@@ -11,7 +11,7 @@
     "transport": "stdio",
     "log_level": "INFO",
     "env": {
-      "CAKE_MODE": "essentials"
+      "PRS_MCP_MODE": "essentials"
     }
   }
 }

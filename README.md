@@ -1,108 +1,112 @@
-# mcp-template
+# just-prs-mcp
 
-A **uv + [FastMCP](https://gofastmcp.com)** server template — a clean skeleton
-with the patterns, scripts, and glue you actually need, optimized for use with
-agentic coding tools (Claude Code, Cursor, Codex, Antigravity).
+An MCP server that wraps **[just-prs](https://pypi.org/project/just-prs/)** — a
+[Polars](https://pola.rs/)-based tool for **Polygenic Risk Scores (PRS)** from the
+[PGS Catalog](https://www.pgscatalog.org/). It exposes catalog search, PRS
+computation, VCF/array normalization, percentile & absolute-risk estimation,
+quality assessment, and (in extended mode) bulk downloads and reference-panel /
+pgen scoring as MCP tools.
 
-The demo domain is **cake/baking** (recipes, a simulated long-running bake, and a
-fake "Bakery Cloud" API for the auth demo). Replace the cake tools with your own;
-keep the structure.
+Built on **uv + [FastMCP](https://gofastmcp.com)**.
 
 > Agents: start with [AGENTS.md](./AGENTS.md).
 
 ## Highlights
 
-- **uv** packaging with the `uv_build` backend.
-- **Hybrid tool registration with modes** — an `essentials` surface that's always
-  on, plus `extended` tools registered on start. Keeps the default tool list
-  small to avoid polluting an agent's context.
-- **Boot-safe runtime auth** — the server never requires a key to start. Key-gated
-  tools resolve credentials **per request / per session** (multi-user safe), via
-  an `authenticate` tool, an HTTP header, Smithery config, or env.
-- **Real background tasks** out of the box — `@mcp.tool(task=True)` with FastMCP's
-  in-memory backend (no Redis); `FASTMCP_DOCKET_URL` switches to Redis for scale.
-- **Structured I/O** via Pydantic models + tool annotations.
+- **Hybrid tool registration with modes** — a small always-on `essentials`
+  surface (catalog lookup + the core compute/analyze workflow) plus an
+  `extended` surface (batch, bulk downloads, HuggingFace upload, reference/pgen
+  scoring) registered on opt-in. Keeps the default tool list small.
+- **Real background tasks** — slow operations (`normalize_vcf`,
+  `compute_prs_batch`, downloads, reference scoring) run as
+  `@mcp.tool(task=True)` with FastMCP's in-memory backend (no Redis);
+  `FASTMCP_DOCKET_URL` switches to Redis for scale.
+- **Structured I/O** via Pydantic models + tool annotations — just-prs's own
+  `PRSResult` / `AbsoluteRisk` / `TraitInfo` are returned directly where they fit.
+- **Boot-safe** — the server starts with no environment configured; no API key
+  is required for any core feature.
 - **In-memory test harness** (`Client(transport=server)`) — fast, deterministic,
-  no network.
-- **Pre-wired client configs** for Claude Code, Cursor, and VS Code.
-- Optional **Docker** and **Smithery** deployment.
+  network-free.
 
 ## Quickstart
 
 ```bash
-uv sync
-uv run pytest                      # 14 tests, all in-memory
-uv run mcp-template stdio          # run over stdio
-uv run mcp-template http           # run over HTTP (default :3011)
-uv run mcp-template stdio --mode extended   # expose the full tool surface
-uv run fastmcp dev fastmcp.json    # MCP Inspector
+uv sync                                  # install deps (incl. dev)
+uv sync --extra reference                # + pgenlib for reference/pgen tools (Linux/WSL)
+uv run pytest                            # tests, all in-memory (no network)
+uv run just-prs-mcp stdio                # run over stdio
+uv run just-prs-mcp stdio --mode extended  # expose the full tool surface
+uv run just-prs-mcp http                 # run over HTTP (default :3011)
+uv run fastmcp dev fastmcp.json          # MCP Inspector
 ```
 
 The server **boots with no environment configured.**
 
-## Tools (cake demo)
+## Tools
 
-| Tool | Tier | Key? | Notes |
-|------|------|------|-------|
-| `list_recipes` | essentials | no | read-only |
-| `get_recipe` | essentials | no | read-only |
-| `bake_cake` | essentials | no | real background task (`task=True`), streams progress |
-| `authenticate` | always | — | unlocks gated tools for *this session* |
-| `scale_recipe` | extended | no | `--mode extended` |
-| `suggest_pairings` | extended | no | `--mode extended` |
-| `continue_bake` | extended | no | `--mode extended` |
-| `order_custom_cake` | gated | yes | needs an API key (demo: `cake_*`) |
-| `delivery_status` | gated | yes | needs an API key |
+| Tool | Tier | Notes |
+|------|------|-------|
+| `search_scores` | essentials | Search the PGS Catalog by free text |
+| `score_info` | essentials | Cleaned metadata for one PGS ID |
+| `best_performance` | essentials | Best evaluation metrics (OR/HR/AUROC/C-index) |
+| `search_traits` | essentials | REST trait search |
+| `trait_info` | essentials | Trait by EFO ID + associated PGS IDs |
+| `normalize_vcf` | essentials | VCF → genotype Parquet (background task) |
+| `compute_prs` | essentials | Score one VCF against one PGS |
+| `percentile` | essentials | Percentile of a PRS value (reference/theoretical/AUROC) |
+| `absolute_risk` | essentials | Absolute disease risk from a PRS z-score |
+| `assess_quality` | essentials | Quality label + interpretation (pure logic) |
+| `compute_prs_batch` | extended | Score one VCF against many PGS (background task) |
+| `normalize_array` | extended | 23andMe / AncestryDNA → Parquet (background task) |
+| `download_scoring_file` | extended | One harmonized scoring file from EBI FTP |
+| `list_pgs_ids` | extended | All PGS IDs on EBI FTP |
+| `download_all_metadata` | extended | All metadata sheets as Parquet (background task) |
+| `bulk_download_scores` | extended | Many/all scoring files (background task) |
+| `push_catalog_to_hf` | extended | Upload cleaned catalog to HuggingFace (needs token) |
+| `download_reference_panel` | extended | Fetch 1000G / HGDP+1kGP panel (background task) |
+| `reference_score` / `reference_score_batch` | extended | Score against a panel (needs `pgenlib`) |
+| `pgen_read_pvar` / `pgen_read_psam` / `pgen_score` | extended | PLINK2 binary ops (needs `pgenlib`) |
 
-Plus a resource (`resource://cakes/pantry`) and a prompt (`bake_a_cake`).
+Plus a resource (`resource://prs/panels`) and a prompt (`compute_prs_for_trait`).
+
+> **File paths:** computation tools take local paths (VCF / normalized Parquet /
+> `.pgen` dir) on the **server's** filesystem. Over stdio that's your machine.
+> **Reference / pgen tools** need the optional native `pgenlib` (Linux/WSL —
+> `uv sync --extra reference`); without it they return a clear install hint.
 
 ## Modes
 
-`CAKE_MODE` (env) or `--mode` (CLI), default `essentials`:
+`PRS_MCP_MODE` (env) or `--mode` (CLI), default `essentials`:
 
-- `essentials` — minimal, casual surface (low context cost).
-- `extended` — everything.
-
-## Auth model (read this)
-
-The server **never** raises at startup for a missing key. Key-gated tools resolve
-a key **per request**, in this order:
-
-1. `X-Cake-Api-Key` HTTP header (multi-user safe)
-2. Smithery-injected session config
-3. per-session key set via the `authenticate` tool
-4. `CAKE_API_KEY` env (single-tenant / local default)
-
-If none resolve, gated tools return a friendly message (no exception). A key set
-via `authenticate` is scoped to the caller's own session, so it never leaks
-between HTTP clients. See [AGENTS.md](./AGENTS.md) for the multi-tenant caveat
-about `mcp.enable()`.
-
-## Using with coding agents
-
-Pre-wired configs are included:
-
-- Claude Code → `.mcp.json`
-- Cursor → `.cursor/mcp.json`
-- VS Code → `.vscode/mcp.json`
-
-They launch `uv run mcp-template stdio`. For **Codex** (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.cake]
-command = "uv"
-args = ["run", "mcp-template", "stdio"]
-```
+- `essentials` — catalog lookup + the core compute/analyze workflow.
+- `extended` — everything (batch, bulk downloads, HF upload, reference/pgen).
 
 ## Configuration
 
-All `CAKE_*` env vars are optional (see `.env.example` and `settings.py`):
-`CAKE_API_KEY`, `CAKE_MODE`, `CAKE_TRANSPORT`, `CAKE_HOST`, `CAKE_PORT`,
-`CAKE_LOG_LEVEL`, `CAKE_API_KEY_HEADER`, `CAKE_OVEN_MAX_TEMP_C`.
+All `PRS_MCP_*` env vars are optional (see `.env.example` and `settings.py`):
+`PRS_MCP_MODE`, `PRS_MCP_CACHE_DIR`, `PRS_MCP_DEFAULT_GENOME_BUILD`,
+`PRS_MCP_DEFAULT_PANEL`, `PRS_MCP_DUCKDB_MEMORY_LIMIT`, `PRS_MCP_HF_TOKEN`,
+`PRS_MCP_TRANSPORT`, `PRS_MCP_HOST`, `PRS_MCP_PORT`, `PRS_MCP_LOG_LEVEL`.
+
+`PRS_MCP_CACHE_DIR` sets the root for cached catalog metadata, scoring files, and
+reference panels; if unset, just-prs uses its own default (`PRS_CACHE_DIR` /
+platformdirs). The HuggingFace upload tool reads `PRS_MCP_HF_TOKEN` or the native
+`HF_TOKEN`.
+
+## Using with coding agents
+
+`.mcp.json` (Claude Code) launches `uv run just-prs-mcp stdio`. For **Codex**
+(`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.just-prs]
+command = "uv"
+args = ["run", "just-prs-mcp", "stdio"]
+```
 
 ## Deployment
 
-- **Docker**: `docker build -t cake-mcp . && docker run -p 3011:3011 cake-mcp`
+- **Docker**: `docker build -t just-prs-mcp . && docker run -p 3011:3011 just-prs-mcp`
   (defaults to HTTP).
 - **Smithery**: `uv sync --extra smithery`; entrypoint in `pyproject.toml`
   `[tool.smithery]` + `smithery.yaml`.
@@ -111,23 +115,19 @@ All `CAKE_*` env vars are optional (see `.env.example` and `settings.py`):
 ## Project layout
 
 ```
-src/mcp_template/
+src/just_prs_mcp/
   server.py        build_server(), CLI, graceful shutdown, Smithery entrypoint
-  settings.py      pydantic-settings (CAKE_*), safe defaults
-  auth.py          per-session/per-request key resolution + authenticate tool
-  models.py        Pydantic tool I/O models
+  settings.py      pydantic-settings (PRS_MCP_*), safe defaults
+  client.py        shared PRSCatalog / REST-client construction + adapters
+  models.py        Pydantic tool I/O models (+ reused just-prs models)
   logging_setup.py stdlib logging -> stderr
   tools/
-    recipes.py       essentials (always)
-    extended.py      extended-only (mode=extended)
-    bakery_cloud.py  key-gated (tag: bakery_cloud)
-    data.py          in-memory recipe fixtures
-tests/             in-memory client tests
+    catalog.py       essentials — PGS Catalog lookup
+    compute.py       essentials — normalize / compute / analyze
+    extended.py      extended — batch, downloads, HF upload
+    reference.py     extended — reference-panel / pgen scoring (pgenlib)
+tests/             in-memory client tests (wiring, not just-prs correctness)
 ```
-
-## Make it yours
-
-See the "Renaming the template" section in [AGENTS.md](./AGENTS.md).
 
 ## License
 

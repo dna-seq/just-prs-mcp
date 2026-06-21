@@ -2,6 +2,11 @@
 
 Passing the server object straight to ``Client`` uses FastMCP's in-memory
 transport — fast, deterministic, and ideal for agent-driven TDD loops.
+
+These tests cover the MCP *wiring* (tool registration, mode gating, structured
+output, error handling) — not just-prs correctness, which has its own real-data
+suite. Tools that hit the PGS Catalog / EBI FTP are exercised only in tests
+marked ``@pytest.mark.network`` (deselected by default).
 """
 
 from __future__ import annotations
@@ -9,8 +14,8 @@ from __future__ import annotations
 import pytest
 from fastmcp.client import Client
 
-from mcp_template.server import build_server
-from mcp_template.settings import Mode, Settings
+from just_prs_mcp.server import build_server
+from just_prs_mcp.settings import Mode, Settings
 
 
 @pytest.fixture

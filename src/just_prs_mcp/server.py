@@ -1,13 +1,16 @@
 """FastMCP server: assembly, CLI, and deployment entrypoints.
 
-The hybrid registration pattern lives in ``build_server``:
+The registration pattern lives in ``build_server``:
 
-* ``register_essentials`` — always (the tools present in every mode).
-* ``register_auth``       — always (the per-session ``authenticate`` tool).
-* ``register_bakery_cloud`` — always listed, auth enforced per call.
-* ``register_extended``   — ONLY when mode == "extended" (registered on start).
+* ``register_catalog``   — always (PGS Catalog lookup; read-only essentials).
+* ``register_compute``   — always (normalize + PRS + analysis essentials).
+* ``register_extended``  — ONLY when mode == "extended" (batch, downloads, HF).
+* ``register_reference`` — ONLY when mode == "extended" (reference / pgen scoring).
 
-The server NEVER raises at startup for a missing key (see auth.py).
+No authentication tier: just-prs needs no API key for its core work. The
+HuggingFace upload tool resolves a token from ``PRS_MCP_HF_TOKEN`` / ``HF_TOKEN``
+per call and returns a friendly result if none is set. The server NEVER raises at
+startup for missing configuration.
 """
 
 from __future__ import annotations
@@ -18,13 +21,13 @@ import sys
 import typer
 from fastmcp import FastMCP
 
-from mcp_template import __version__
-from mcp_template.auth import SessionKeyStore, register_auth
-from mcp_template.logging_setup import get_logger, setup_logging
-from mcp_template.settings import Mode, Settings
-from mcp_template.tools.bakery_cloud import register_bakery_cloud
-from mcp_template.tools.extended import register_extended
-from mcp_template.tools.recipes import register_essentials
+from just_prs_mcp import __version__
+from just_prs_mcp.logging_setup import get_logger, setup_logging
+from just_prs_mcp.settings import Mode, Settings
+from just_prs_mcp.tools.catalog import register_catalog
+from just_prs_mcp.tools.compute import register_compute
+from just_prs_mcp.tools.extended import register_extended
+from just_prs_mcp.tools.reference import register_reference
 
 log = get_logger()
 
@@ -40,32 +43,36 @@ def build_server(mode: Mode | None = None, settings: Settings | None = None) -> 
     setup_logging(settings)
 
     mcp = FastMCP(
-        name=f"Cake MCP Template v{__version__}",
+        name=f"just-prs MCP v{__version__}",
         instructions=(
-            "A cake-themed FastMCP template. Essentials (recipes + baking) are "
-            "always available; run in 'extended' mode for more tools. Bakery "
-            "Cloud tools require an API key via the `authenticate` tool."
+            "An MCP server for polygenic risk scores, wrapping the just-prs library "
+            "and the PGS Catalog. Essentials (catalog search/lookup, VCF "
+            "normalization, PRS computation, percentile/absolute-risk/quality "
+            "analysis) are always available. Run in 'extended' mode for batch "
+            "scoring, bulk catalog downloads, HuggingFace upload, and "
+            "reference-panel / pgen scoring (the last needs the optional pgenlib "
+            "dependency on Linux/WSL). Computation tools take local file paths "
+            "(VCF / normalized Parquet) on the server's filesystem."
         ),
     )
 
-    store = SessionKeyStore()
-    register_essentials(mcp, settings)
-    register_auth(mcp, settings, store)
-    register_bakery_cloud(mcp, settings, store)
+    register_catalog(mcp, settings)
+    register_compute(mcp, settings)
     if resolved_mode == "extended":
         register_extended(mcp, settings)
+        register_reference(mcp, settings)
 
     log.info("Server built (mode=%s)", resolved_mode)
     return mcp
 
 
 # Module-level instance for `fastmcp run` / `fastmcp dev` / Smithery discovery.
-# Safe to import: no key required, no network calls.
+# Safe to import: no key required, no network calls at import time.
 mcp = build_server()
 
 
 # --------------------------------------------------------------------------- #
-# Graceful shutdown (ported pattern: clean SIGINT/SIGTERM handling)
+# Graceful shutdown (clean SIGINT/SIGTERM handling)
 # --------------------------------------------------------------------------- #
 class GracefulShutdownHandler:
     """Handle SIGINT/SIGTERM so the server stops cleanly; double-signal forces."""
@@ -113,9 +120,9 @@ def run_with_graceful_shutdown(server: FastMCP, **run_kwargs) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Typer CLI — `mcp-template [main|stdio|http|sse] --mode ...`
+# Typer CLI — `just-prs-mcp [main|stdio|http|sse] --mode ...`
 # --------------------------------------------------------------------------- #
-app = typer.Typer(add_completion=False, help="Cake MCP Template server.")
+app = typer.Typer(add_completion=False, help="just-prs MCP server.")
 
 _MODE_OPT = typer.Option(None, "--mode", help="essentials | extended")
 
@@ -137,7 +144,7 @@ def main(
     host: str = typer.Option(None, help="Host to bind (network transports)."),
     port: int = typer.Option(None, help="Port to bind (network transports)."),
 ) -> None:
-    """Run the server (transport from --transport or CAKE_TRANSPORT)."""
+    """Run the server (transport from --transport or PRS_MCP_TRANSPORT)."""
     settings = Settings()
     _run(transport or settings.transport, mode, host, port)
 
@@ -175,13 +182,10 @@ def cli_app() -> None:
 
 # --------------------------------------------------------------------------- #
 # Optional Smithery cloud deployment (guarded; needs the `smithery` extra).
-# Note: NO boot-time key requirement. The Smithery-injected per-request config
-# key is consumed by resolve_api_key at call time, not stored globally here.
+# No boot-time configuration is required; cache dir / mode are optional.
 # --------------------------------------------------------------------------- #
 def _smithery_unavailable(ctx):  # pragma: no cover - only when extra missing
-    raise RuntimeError(
-        "Smithery support requires the 'smithery' extra: uv sync --extra smithery"
-    )
+    raise RuntimeError("Smithery support requires the 'smithery' extra: uv sync --extra smithery")
 
 
 try:
@@ -189,13 +193,14 @@ try:
     from smithery.decorators import smithery  # type: ignore[import-not-found]
 
     class SmitheryConfigSchema(BaseModel):
-        api_key: str | None = Field(
-            default=None, description="Optional Bakery Cloud API key."
+        mode: str | None = Field(default=None, description="essentials | extended")
+        cache_dir: str | None = Field(
+            default=None, description="Optional cache directory for catalog/scoring data."
         )
 
     @smithery.server(config_schema=SmitheryConfigSchema)
     def start_mcp_smithery(ctx):  # pragma: no cover - run by Smithery runtime
-        """Smithery entrypoint: return a fresh server (key resolved per request)."""
+        """Smithery entrypoint: return a fresh server."""
         return build_server()
 
 except ImportError:  # pragma: no cover - smithery extra not installed
