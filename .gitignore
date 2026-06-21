@@ -8,6 +8,7 @@ __pycache__/
 .python-version
 # C extensions
 *.so
+docs/t2d*
 
 # Distribution / packaging
 .Python

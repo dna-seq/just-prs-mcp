@@ -24,6 +24,7 @@ from just_prs_mcp.logging_setup import get_logger
 from just_prs_mcp.models import (
     AbsoluteRisk,
     NormalizeResult,
+    OpResult,
     PercentileResult,
     PerformanceSummary,
     PRSResult,
@@ -34,6 +35,23 @@ from just_prs_mcp.models import (
 from just_prs_mcp.settings import Settings
 
 log = get_logger()
+
+# Public sample genomes open-sourced by the just-dna-lite authors (see that
+# project's README). For users who want to try PRS but have no VCF of their own.
+_SAMPLE_GENOMES: dict[str, dict[str, str]] = {
+    "anton": {
+        "record": "18370498",
+        "who": "Anton Kulaga",
+        "license": "CC0 (public domain)",
+    },
+    "livia": {
+        "record": "19487816",
+        "who": "Livia Zaharia",
+        "license": "CC-BY-4.0",
+    },
+}
+
+_VCF_SUFFIXES = (".vcf", ".vcf.gz", ".vcf.bgz")
 
 
 def _require_file(path: str, kind: str) -> Path:
@@ -159,11 +177,67 @@ def _trait_score_row(
         quality_label=quality.quality_label if quality else None,
         quality_summary=quality.summary if quality else None,
         effect_size=(
-            None
-            if not performance or not performance.effect_size
-            else performance.effect_size
+            None if not performance or not performance.effect_size else performance.effect_size
         ),
         auroc_estimate=performance.auroc_estimate if performance else None,
+    )
+
+
+def _zenodo_api_url(sample: str | None, record_url: str | None) -> tuple[str, str]:
+    """Resolve a sample alias or Zenodo record URL/ID to its API URL + a label.
+
+    Raises ``ToolError`` for an unknown alias so the no-network failure path is
+    deterministic and testable.
+    """
+    if record_url:
+        token = record_url.rstrip("/").rsplit("/", 1)[-1]
+        if not token.isdigit():
+            raise ToolError(
+                f"Could not parse a Zenodo record id from '{record_url}'. "
+                "Pass a records URL like 'https://zenodo.org/records/18370498'."
+            )
+        return f"https://zenodo.org/api/records/{token}", f"Zenodo record {token}"
+
+    key = (sample or "").strip().lower()
+    entry = _SAMPLE_GENOMES.get(key)
+    if entry is None:
+        known = ", ".join(sorted(_SAMPLE_GENOMES))
+        raise ToolError(f"Unknown sample '{sample}'. Known samples: {known}; or pass record_url.")
+    label = f"{entry['who']} ({entry['license']})"
+    return f"https://zenodo.org/api/records/{entry['record']}", label
+
+
+def _pick_vcf_file(files: list[dict], filename: str | None) -> dict | None:
+    """Choose the VCF entry from a Zenodo record's ``files`` list.
+
+    With ``filename`` set, match it exactly; otherwise pick the largest file whose
+    key looks like a VCF. Returns ``None`` when nothing matches.
+    """
+    if filename:
+        return next((f for f in files if f.get("key") == filename), None)
+    vcfs = [f for f in files if str(f.get("key", "")).lower().endswith(_VCF_SUFFIXES)]
+    if not vcfs:
+        return None
+    return max(vcfs, key=lambda f: f.get("size") or 0)
+
+
+def _zenodo_download_url(file_entry: dict) -> str | None:
+    """Extract a content download URL from a Zenodo file entry (API shape varies)."""
+    links = file_entry.get("links") or {}
+    return links.get("content") or links.get("download") or links.get("self")
+
+
+def _row_rank_key(row: TraitScoreRow) -> tuple[bool, bool, float]:
+    """Rank rows best-coverage first for ``top_n`` trimming (sorted reverse=True).
+
+    Scored rows outrank failed ones, reliable percentiles outrank unreliable, and
+    higher match rates win the tie — so a trimmed report keeps the most trustworthy
+    scores rather than an arbitrary prefix.
+    """
+    return (
+        row.status == "scored",
+        bool(row.percentile_reliable),
+        row.match_rate if row.match_rate is not None else -1.0,
     )
 
 
@@ -252,6 +326,104 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         )
 
     @mcp.tool(
+        task=True,
+        annotations=ToolAnnotations(
+            title="Download sample genome", readOnlyHint=False, openWorldHint=True
+        ),
+    )
+    async def download_sample_genome(
+        ctx: Context,
+        sample: str = "anton",
+        output_dir: str | None = None,
+        record_url: str | None = None,
+        filename: str | None = None,
+    ) -> OpResult:
+        """Download a public sample WGS VCF from Zenodo to try PRS without your own data.
+
+        For users who don't have their own VCF: two genomes open-sourced by the
+        just-dna-lite authors are available — ``sample="anton"`` (Anton Kulaga,
+        CC0) and ``sample="livia"`` (Livia Zaharia, CC-BY-4.0). Pass ``record_url``
+        (e.g. 'https://zenodo.org/records/18370498') to fetch any other Zenodo
+        record, and ``filename`` to pick a specific file when a record has several.
+
+        The downloaded ``.vcf`` / ``.vcf.gz`` lands under the cache dir (or
+        ``output_dir``) and is a drop-in path for ``normalize_vcf`` / ``compute_prs``.
+        Returns an ``OpResult`` whose ``data`` carries the local ``path`` on success.
+        Runs as a background task (the file is several GB for a full WGS genome).
+        """
+        import httpx
+
+        try:
+            api_url, label = _zenodo_api_url(sample, record_url)
+        except ToolError as exc:
+            return OpResult(success=False, message=str(exc))
+
+        out_dir = (
+            Path(output_dir).expanduser()
+            if output_dir
+            else client.resolved_cache_dir(settings) / "samples"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        await ctx.info(f"Resolving {label} on Zenodo ...")
+        try:
+            timeout = httpx.Timeout(60.0, read=300.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+                meta_resp = await http.get(api_url)
+                meta_resp.raise_for_status()
+                files = meta_resp.json().get("files", [])
+                chosen = _pick_vcf_file(files, filename)
+                if chosen is None:
+                    available = ", ".join(str(f.get("key")) for f in files) or "(none)"
+                    return OpResult(
+                        success=False,
+                        message=(
+                            f"No VCF found in {label}. Available files: {available}. "
+                            "Pass filename= to pick one explicitly."
+                        ),
+                    )
+                download_url = _zenodo_download_url(chosen)
+                if not download_url:
+                    return OpResult(
+                        success=False,
+                        message=f"Could not resolve a download URL for '{chosen.get('key')}'.",
+                    )
+
+                dest = out_dir / str(chosen["key"])
+                total = int(chosen.get("size") or 0)
+                await ctx.info(
+                    f"Downloading {chosen['key']} ({total / 1e9:.2f} GB) from {label} -> {dest}"
+                )
+                await ctx.report_progress(progress=0, total=max(1, total))
+                downloaded = 0
+                with dest.open("wb") as fh:
+                    async with http.stream("GET", download_url) as resp:
+                        resp.raise_for_status()
+                        total = int(resp.headers.get("content-length") or total) or total
+                        async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
+                            fh.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                await ctx.report_progress(progress=downloaded, total=total)
+        except Exception as exc:  # noqa: BLE001 — download outcome is data, not a protocol error
+            return OpResult(success=False, message=f"Sample download failed: {exc}")
+
+        log.info("Downloaded sample genome %s (%d bytes) -> %s", chosen["key"], downloaded, dest)
+        return OpResult(
+            success=True,
+            message=(
+                f"Downloaded {chosen['key']} ({downloaded / 1e9:.2f} GB) from {label}. "
+                f"Pass it to normalize_vcf or compute_prs as the VCF path."
+            ),
+            data={
+                "path": str(dest),
+                "filename": str(chosen["key"]),
+                "bytes": downloaded,
+                "source": label,
+            },
+        )
+
+    @mcp.tool(
         annotations=ToolAnnotations(title="Compute PRS", readOnlyHint=True, openWorldHint=True)
     )
     def compute_prs(
@@ -336,12 +508,21 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         interpret: bool = False,
         superpopulation: str = "EUR",
         panel: str | None = None,
+        top_n: int | None = None,
     ) -> TraitPRSReport:
         """Compute all directly associated PRS scores for a trait ontology ID.
 
         ``trait_id`` may be an EFO or MONDO identifier. Set ``include_children``
         to also score PGS IDs associated through descendant traits. ``limit`` caps
-        the number scored and reports skipped IDs explicitly.
+        how many scores are *computed* and reports skipped IDs explicitly.
+
+        ``top_n`` caps how many per-score rows are *returned*: rows are ranked
+        best-coverage first (scored before failed, reliable percentile before not,
+        higher match rate first) and the rest are trimmed, with ``n_omitted``
+        reporting the count. A big trait (100+ scores) with ``interpret=True`` can
+        otherwise exceed the client's output-token limit; trait-level counts and
+        ``mean_match_rate`` always reflect every score, so trimming is explicit,
+        never silent.
         """
         b = client.build(settings, genome_build)
         try:
@@ -358,8 +539,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         n_skipped = max(0, n_total - len(selected_ids))
 
         await ctx.info(
-            f"Trait {trait.id} has {n_total} candidate PGS ID(s); "
-            f"scoring {len(selected_ids)}"
+            f"Trait {trait.id} has {n_total} candidate PGS ID(s); scoring {len(selected_ids)}"
         )
         await ctx.report_progress(progress=0, total=max(1, len(selected_ids)))
 
@@ -441,6 +621,22 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
 
         n_scored = sum(1 for row in rows if row.status == "scored")
         n_failed = sum(1 for row in rows if row.status == "failed")
+        n_reliable = sum(1 for row in rows if row.percentile_reliable)
+        match_rates = [row.match_rate for row in rows if row.match_rate is not None]
+        mean_match_rate = sum(match_rates) / len(match_rates) if match_rates else None
+
+        ranked = sorted(rows, key=_row_rank_key, reverse=True)
+        returned = ranked if top_n is None else ranked[: max(0, top_n)]
+        n_omitted = len(rows) - len(returned)
+
+        summary = (
+            f"Scored {n_scored}/{len(selected_ids)} PGS ID(s) for {trait.label or trait.id} "
+            f"on {b}; {n_failed} failed, {n_skipped} skipped by limit"
+        )
+        if mean_match_rate is not None:
+            summary += f"; mean coverage {mean_match_rate:.0%}, {n_reliable} reliable percentile(s)"
+        if n_omitted:
+            summary += f"; {n_omitted} row(s) trimmed from response by top_n={top_n}"
         return TraitPRSReport(
             trait_id=trait.id,
             label=trait.label or trait.id,
@@ -449,11 +645,12 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             n_scored=n_scored,
             n_failed=n_failed,
             n_skipped=n_skipped,
-            rows=rows,
-            summary=(
-                f"Scored {n_scored}/{len(selected_ids)} PGS ID(s) for {trait.label or trait.id} "
-                f"on {b}; {n_failed} failed, {n_skipped} skipped by limit."
-            ),
+            n_reliable=n_reliable,
+            mean_match_rate=mean_match_rate,
+            n_returned=len(returned),
+            n_omitted=n_omitted,
+            rows=returned,
+            summary=summary + ".",
         )
 
     @mcp.tool(

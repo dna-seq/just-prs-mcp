@@ -1,9 +1,10 @@
 """EXTENDED — heavier / opt-in tools (registered only when mode == "extended").
 
-Consumer-array normalization, scoring-file and bulk catalog downloads, and the
-HuggingFace catalog upload. Long-running operations run as background tasks;
-download/upload tools return a typed ``OpResult`` so partial-success and
-missing-credential states are data, not exceptions.
+Consumer-array normalization, scoring-file and bulk catalog downloads, the
+HuggingFace catalog upload, prevalence-prior inspection, and multi-method
+absolute risk. Long-running operations run as background tasks; download/upload
+tools return a typed ``OpResult`` so partial-success and missing-credential
+states are data, not exceptions.
 
 Opt in via ``PRS_MCP_MODE=extended`` / ``--mode extended``.
 """
@@ -20,16 +21,43 @@ from mcp.types import ToolAnnotations
 
 from just_prs_mcp import client
 from just_prs_mcp.logging_setup import get_logger
-from just_prs_mcp.models import NormalizeResult, OpResult
+from just_prs_mcp.models import (
+    AbsoluteRiskBundle,
+    NormalizeResult,
+    OpResult,
+    PrevalenceInfo,
+    PrevalenceRow,
+)
 from just_prs_mcp.settings import Settings
 
 log = get_logger()
+
+_PREVALENCE_FIELDS = (
+    "efo_id",
+    "trait_label",
+    "prevalence",
+    "prevalence_lower",
+    "prevalence_upper",
+    "prevalence_type",
+    "sex",
+    "ancestry",
+    "age_range",
+    "source",
+    "source_detail",
+    "xref_mondo",
+    "xref_icd10",
+    "confidence",
+)
 
 
 def _count_rows(parquet_path: Path) -> int:
     import polars as pl
 
     return int(pl.scan_parquet(parquet_path).select(pl.len()).collect().item())
+
+
+def _prevalence_row(row: dict) -> PrevalenceRow:
+    return PrevalenceRow(**{field: row.get(field) for field in _PREVALENCE_FIELDS})
 
 
 def register_extended(mcp: FastMCP, settings: Settings) -> None:
@@ -198,6 +226,103 @@ def register_extended(mcp: FastMCP, settings: Settings) -> None:
             message=f"Downloaded {len(paths)} scoring file(s) to {out}.",
             data={"output_dir": str(out), "n_files": len(paths)},
         )
+
+    @mcp.tool(
+        tags={"extended"},
+        annotations=ToolAnnotations(
+            title="Prevalence prior", readOnlyHint=True, openWorldHint=True
+        ),
+    )
+    def prevalence_info(
+        pgs_id: str | None = None,
+        trait_id: str | None = None,
+    ) -> PrevalenceInfo:
+        """Inspect the population-prevalence prior just-prs uses for absolute risk.
+
+        ``absolute_risk`` reports the prior it applied, but only as a side effect of
+        a risk calc that needs a z-score. This surfaces the prior directly: pass a
+        ``trait_id`` (EFO or MONDO) or a ``pgs_id`` (resolved to its EFO trait IDs),
+        and get the matching rows from just-prs's prevalence table — value, bounds,
+        type, sex/ancestry/age scope, source, and confidence. Returns no rows (not
+        an error) when the catalog has no prior for the trait.
+        """
+        if not pgs_id and not trait_id:
+            raise ToolError("Provide pgs_id or trait_id.")
+        import polars as pl
+        from just_prs.ontology import expand_trait_ids_from_alias_columns
+
+        cat = client.make_catalog(settings)
+        efo_ids: list[str] = []
+        if trait_id:
+            efo_ids.append(trait_id.strip())
+        if pgs_id:
+            try:
+                info = cat.score_info_row(pgs_id)
+            except Exception as exc:  # noqa: BLE001
+                raise ToolError(f"Score lookup failed for {pgs_id}: {exc}") from exc
+            if info is None:
+                raise ToolError(f"Unknown PGS ID '{pgs_id}'.")
+            raw = info.get("trait_efo_id")
+            if raw:
+                efo_ids.extend(e.strip() for e in str(raw).split(",") if e.strip())
+        efo_ids = list(dict.fromkeys(e for e in efo_ids if e))
+        if not efo_ids:
+            raise ToolError(f"Could not resolve any trait ontology ID for {pgs_id or trait_id}.")
+
+        try:
+            df = cat.prevalence_table().collect()
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"Prevalence table unavailable: {exc}") from exc
+
+        if df.height:
+            expanded = expand_trait_ids_from_alias_columns(efo_ids, df)
+            cols = df.columns
+            mask = pl.col("efo_id").is_in(expanded)
+            if "xref_mondo" in cols:
+                mask = mask | pl.col("xref_mondo").is_in(expanded)
+            rows = [_prevalence_row(r) for r in df.filter(mask).to_dicts()]
+        else:
+            expanded = efo_ids
+            rows = []
+
+        return PrevalenceInfo(
+            query=pgs_id or trait_id or "",
+            resolved_efo_ids=expanded,
+            n_matches=len(rows),
+            rows=rows,
+            message=(
+                f"Found {len(rows)} prevalence prior row(s) for "
+                f"{', '.join(expanded)}."
+                if rows
+                else f"No prevalence prior in the catalog for {', '.join(expanded)}."
+            ),
+        )
+
+    @mcp.tool(
+        tags={"extended"},
+        annotations=ToolAnnotations(
+            title="Absolute risk (all methods)", readOnlyHint=True, openWorldHint=True
+        ),
+    )
+    def absolute_risk_bundle(
+        pgs_id: str,
+        z_score: float,
+        sex: str | None = None,
+    ) -> AbsoluteRiskBundle:
+        """Compute every available absolute-risk estimate for a score, with agreement.
+
+        Unlike the single-method ``absolute_risk`` (essentials), this runs every
+        method the data supports — OR-per-SD and AUC-bivariate (from best
+        performance) and h²-liability (per ancestry/source from the heritability
+        table) — and returns all estimates, a best pick, and how well they agree.
+        Each estimate carries the population-prevalence prior it used. ``z_score``
+        is the PRS in SDs from the population mean. Returns an empty bundle when the
+        prevalence prior is unavailable.
+        """
+        try:
+            return client.make_catalog(settings).absolute_risk_bundle(pgs_id, z_score, sex=sex)
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"Absolute-risk bundle failed for {pgs_id}: {exc}") from exc
 
     @mcp.tool(
         task=True,

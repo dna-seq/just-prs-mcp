@@ -4,7 +4,8 @@ The registration pattern lives in ``build_server``:
 
 * ``register_catalog``   — always (PGS Catalog lookup; read-only essentials).
 * ``register_compute``   — always (normalize + single/batch/by-trait PRS + analysis).
-* ``register_extended``  — ONLY when mode == "extended" (downloads, arrays, HF).
+* ``register_extended``  — ONLY when mode == "extended" (downloads, arrays, HF,
+  prevalence priors, multi-method absolute risk).
 * ``register_reference`` — ONLY when mode == "extended" (reference / pgen scoring).
 
 No authentication tier: just-prs needs no API key for its core work. The
@@ -48,8 +49,10 @@ def build_server(mode: Mode | None = None, settings: Settings | None = None) -> 
             "An MCP server for polygenic risk scores, wrapping the just-prs library "
             "and the PGS Catalog. Essentials (catalog search/lookup, VCF "
             "normalization, PRS computation, percentile/absolute-risk/quality "
-            "analysis, batch scoring, and by-trait reports) are always available. "
-            "Run in 'extended' mode for bulk catalog downloads, HuggingFace upload, and "
+            "analysis, batch scoring, by-trait reports, and a sample-genome "
+            "download for users without their own VCF) are always available. "
+            "Run in 'extended' mode for bulk catalog downloads, HuggingFace upload, "
+            "prevalence-prior inspection, multi-method absolute risk, and "
             "reference-panel / pgen scoring (the last needs the optional pgenlib "
             "dependency on Linux/WSL). Computation tools take local file paths "
             "(VCF / normalized Parquet) on the server's filesystem."

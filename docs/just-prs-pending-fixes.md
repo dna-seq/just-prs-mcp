@@ -78,7 +78,12 @@ effect-size estimate exists.
 `percentile` does not expose the z-score or reference mean/std it used.
 
 Wrapper mitigation: no reliable wrapper-only z-score can be produced without the
-library exposing reference distribution parameters.
+library exposing reference distribution parameters. The *prevalence prior* side of
+absolute risk is now fully exposed in extended mode — `prevalence_info` surfaces
+just-prs's prevalence table for a score/trait (value, bounds, type, scope, source,
+confidence) without needing a z-score, and `absolute_risk_bundle` returns every
+method's estimate with the prior it used. The remaining gap is purely the
+raw-score → z-score step.
 
 Library fix: return the derived `z_score` plus reference mean/std from
 `percentile`, or add `absolute_risk_from_score` that chains raw PRS to z-score to

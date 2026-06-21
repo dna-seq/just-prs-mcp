@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from just_prs.models import TraitInfo
 
 
@@ -58,9 +59,7 @@ async def test_trait_info_accepts_trait_id_and_efo_id(essentials_client, monkeyp
 
     monkeypatch.setattr(mcp_client, "make_rest_client", FakeRestClient)
 
-    by_trait_id = await essentials_client.call_tool(
-        "trait_info", {"trait_id": "MONDO_0005148"}
-    )
+    by_trait_id = await essentials_client.call_tool("trait_info", {"trait_id": "MONDO_0005148"})
     by_efo_id = await essentials_client.call_tool("trait_info", {"efo_id": "EFO_0001645"})
 
     assert by_trait_id.data.id == "MONDO_0005148"
@@ -111,3 +110,194 @@ async def test_percentile_low_match_rate_is_unreliable(essentials_client, monkey
     assert result.data.percentile == 0.0
     assert result.data.reliable is False
     assert "Match rate" in result.data.caveat
+
+
+class FakeReportRest:
+    """Rest client whose trait carries three associated PGS IDs."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def get_trait(self, trait_id: str) -> TraitInfo:
+        return TraitInfo(
+            id=trait_id,
+            label="type 2 diabetes mellitus",
+            description=None,
+            url="https://example.test/trait",
+            trait_categories=[],
+            trait_synonyms=[],
+            associated_pgs_ids=["PGS000001", "PGS000002", "PGS000003"],
+            child_associated_pgs_ids=[],
+        )
+
+
+class FakeBatchCatalog:
+    """Catalog whose batch scoring returns deterministic, varied match rates."""
+
+    _RATES = {"PGS000001": 0.95, "PGS000002": 0.40, "PGS000003": 0.70}
+
+    def compute_prs_batch(self, vcf_path, pgs_ids, genome_build):
+        from just_prs.models import PRSResult
+
+        return [
+            PRSResult(
+                pgs_id=pgs_id,
+                score=1.0,
+                variants_matched=int(1000 * self._RATES[pgs_id]),
+                variants_total=1000,
+                match_rate=self._RATES[pgs_id],
+            )
+            for pgs_id in pgs_ids
+        ]
+
+
+async def test_compute_prs_by_trait_top_n_trims_and_ranks(essentials_client, monkeypatch, tmp_path):
+    """F14: top_n returns the best-covered rows, accounts for omissions, aggregates all."""
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_rest_client", FakeReportRest)
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeBatchCatalog())
+
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text("##fileformat=VCFv4.2\n")
+
+    result = await essentials_client.call_tool(
+        "compute_prs_by_trait",
+        {"trait_id": "MONDO_0005148", "vcf_path": str(vcf), "top_n": 2},
+    )
+    report = result.data
+
+    assert report.n_scored == 3
+    assert report.n_returned == 2
+    assert report.n_omitted == 1
+    # Ranked best-coverage first; the 0.40 score is trimmed, not an arbitrary one.
+    assert [row.pgs_id for row in report.rows] == ["PGS000001", "PGS000003"]
+    assert report.mean_match_rate == pytest.approx((0.95 + 0.40 + 0.70) / 3)
+
+
+async def test_download_sample_genome_unknown_sample_is_recoverable(essentials_client):
+    """Bad sample alias returns an OpResult, never a protocol error, with no network."""
+    result = await essentials_client.call_tool(
+        "download_sample_genome", {"sample": "not-a-real-person"}
+    )
+
+    assert result.data.success is False
+    assert "Unknown sample" in result.data.message
+
+
+class FakePrevalenceCatalog:
+    """Catalog exposing a tiny in-memory prevalence table + score->EFO mapping."""
+
+    def score_info_row(self, pgs_id: str) -> dict:
+        return {"pgs_id": pgs_id, "trait_efo_id": "EFO_0001360"}
+
+    def prevalence_table(self):
+        import polars as pl
+
+        return pl.LazyFrame(
+            {
+                "efo_id": ["EFO_0001360", "EFO_9999"],
+                "trait_label": ["type 2 diabetes mellitus", "other"],
+                "prevalence": [0.09, 0.01],
+                "prevalence_type": ["lifetime", "point"],
+                "source": ["seed", "pgs_eval"],
+                "confidence": ["high", "low"],
+                "xref_mondo": ["MONDO_0005148", None],
+            }
+        )
+
+
+async def test_prevalence_info_by_pgs_id_surfaces_the_prior(extended_client, monkeypatch):
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakePrevalenceCatalog())
+
+    result = await extended_client.call_tool("prevalence_info", {"pgs_id": "PGS000014"})
+
+    assert result.data.resolved_efo_ids == ["EFO_0001360"]
+    assert result.data.n_matches == 1
+    assert result.data.rows[0].prevalence == 0.09
+    assert result.data.rows[0].confidence == "high"
+
+
+async def test_prevalence_info_by_mondo_trait_id(extended_client, monkeypatch):
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakePrevalenceCatalog())
+
+    result = await extended_client.call_tool(
+        "prevalence_info", {"trait_id": "MONDO_0005148"}
+    )
+
+    assert result.data.n_matches == 1
+    assert result.data.rows[0].xref_mondo == "MONDO_0005148"
+
+
+async def test_prevalence_info_requires_an_id(extended_client):
+    from fastmcp.exceptions import ToolError
+
+    with pytest.raises(ToolError):
+        await extended_client.call_tool("prevalence_info", {})
+
+
+class FakeBundleCatalog:
+    def absolute_risk_bundle(self, pgs_id: str, z_score: float, sex=None):
+        from just_prs.models import AbsoluteRiskBundle, AbsoluteRiskEstimate
+
+        est = AbsoluteRiskEstimate(
+            absolute_risk=0.14,
+            population_prevalence=0.09,
+            risk_ratio=1.55,
+            method="or_per_sd",
+            method_label="OR per SD",
+            confidence="moderate",
+            prevalence_source="seed",
+            prevalence_type="lifetime",
+        )
+        return AbsoluteRiskBundle(
+            estimates=[est],
+            best_estimate=est,
+            agreement="single",
+            heritability_status="unavailable",
+            heritability_detail="no h2 row",
+            heritability_trait_ids=[],
+        )
+
+
+async def test_absolute_risk_bundle_returns_all_estimates(extended_client, monkeypatch):
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeBundleCatalog())
+
+    result = await extended_client.call_tool(
+        "absolute_risk_bundle", {"pgs_id": "PGS000014", "z_score": 1.2}
+    )
+
+    assert len(result.data.estimates) == 1
+    assert result.data.best_estimate.population_prevalence == 0.09
+    assert result.data.estimates[0].method == "or_per_sd"
+
+
+def test_zenodo_helpers_resolve_samples_and_pick_vcf():
+    from just_prs_mcp.tools.compute import _pick_vcf_file, _zenodo_api_url
+
+    anton_url, anton_label = _zenodo_api_url("anton", None)
+    assert anton_url.endswith("/records/18370498")
+    assert "Anton" in anton_label
+
+    by_url, _ = _zenodo_api_url(None, "https://zenodo.org/records/19487816/")
+    assert by_url.endswith("/records/19487816")
+
+    files = [
+        {"key": "readme.txt", "size": 10, "links": {"self": "u1"}},
+        {"key": "small.vcf.gz", "size": 100, "links": {"self": "u2"}},
+        {"key": "genome.vcf.gz", "size": 9000, "links": {"content": "u3"}},
+    ]
+    largest = _pick_vcf_file(files, None)
+    assert largest is not None and largest["key"] == "genome.vcf.gz"
+    named = _pick_vcf_file(files, "small.vcf.gz")
+    assert named is not None and named["key"] == "small.vcf.gz"
+    assert _pick_vcf_file([{"key": "x.txt", "size": 1, "links": {}}], None) is None

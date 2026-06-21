@@ -15,6 +15,8 @@ from __future__ import annotations
 # Re-exported just-prs models — used directly as tool return types.
 from just_prs.models import (  # noqa: F401
     AbsoluteRisk,
+    AbsoluteRiskBundle,
+    AbsoluteRiskEstimate,
     PRSResult,
     ScoreInfo,
     TraitInfo,
@@ -157,8 +159,63 @@ class TraitPRSReport(BaseModel):
     n_scored: int = Field(description="Number of scores computed successfully.")
     n_failed: int = Field(description="Number of scores that failed.")
     n_skipped: int = Field(description="Number of associated PGS IDs skipped by the limit.")
-    rows: list[TraitScoreRow] = Field(description="Per-score results.")
+    n_reliable: int = Field(
+        default=0,
+        description="Scores whose percentile passed the reliability check (≥90% coverage).",
+    )
+    mean_match_rate: float | None = Field(
+        default=None, description="Mean scoring-variant match rate across computed scores."
+    )
+    n_returned: int = Field(
+        default=0, description="Number of per-score rows included in this response."
+    )
+    n_omitted: int = Field(
+        default=0,
+        description="Rows computed but trimmed from the response by ``top_n`` "
+        "(trait-level counts still reflect all scores).",
+    )
+    rows: list[TraitScoreRow] = Field(
+        description="Per-score results (ranked best-coverage first; trimmed to ``top_n`` when set)."
+    )
     summary: str = Field(description="Human-readable summary.")
+
+
+class PrevalenceRow(BaseModel):
+    """One population-prevalence prior row used for absolute-risk estimation."""
+
+    efo_id: str | None = Field(default=None, description="EFO trait ID this prior is keyed on.")
+    trait_label: str | None = Field(default=None, description="Human-readable trait label.")
+    prevalence: float | None = Field(
+        default=None, description="Population prevalence (fraction, 0-1) — the prior."
+    )
+    prevalence_lower: float | None = Field(default=None, description="Lower bound, if known.")
+    prevalence_upper: float | None = Field(default=None, description="Upper bound, if known.")
+    prevalence_type: str | None = Field(
+        default=None, description="e.g. 'lifetime', 'point', 'period'."
+    )
+    sex: str | None = Field(default=None, description="Sex the prior applies to, if specific.")
+    ancestry: str | None = Field(default=None, description="Ancestry the prior applies to.")
+    age_range: str | None = Field(default=None, description="Age range the prior applies to.")
+    source: str | None = Field(default=None, description="Provenance tier / source.")
+    source_detail: str | None = Field(default=None, description="Citation or source detail.")
+    xref_mondo: str | None = Field(default=None, description="Cross-referenced MONDO ID.")
+    xref_icd10: str | None = Field(default=None, description="Cross-referenced ICD-10 code.")
+    confidence: str | None = Field(default=None, description="high / moderate / low.")
+
+
+class PrevalenceInfo(BaseModel):
+    """Prevalence priors just-prs would apply for a score or trait."""
+
+    query: str = Field(description="The pgs_id or trait_id that was looked up.")
+    resolved_efo_ids: list[str] = Field(
+        default_factory=list,
+        description="EFO trait IDs the query resolved to (after alias expansion).",
+    )
+    n_matches: int = Field(description="Number of matching prevalence rows.")
+    rows: list[PrevalenceRow] = Field(
+        default_factory=list, description="Matching prevalence prior rows."
+    )
+    message: str = Field(description="Human-readable summary.")
 
 
 class QualityAssessment(BaseModel):

@@ -98,8 +98,9 @@ round-trip `@pytest.mark.network`.
 
 ## Background tasks
 
-Slow tools (`normalize_vcf`, `compute_prs_batch`, `compute_prs_by_trait`, the
-download tools, reference scoring) are real MCP background tasks
+Slow tools (`normalize_vcf`, `download_sample_genome`, `compute_prs_batch`,
+`compute_prs_by_trait`, the download tools, reference scoring) are real MCP
+background tasks
 (`@mcp.tool(task=True)`). Some clients expose the task id and polling directly;
 others transparently collapse that handshake and return the final result inline.
 Powered by the `fastmcp[tasks]` extra; default backend is in-memory (`memory://` —
@@ -107,9 +108,15 @@ no Redis). Set `FASTMCP_DOCKET_URL=redis://...` for distributed/persistent tasks
 
 ## Known issues & deferred fixes
 
-- `docs/dogfooding.md` — running log of quirks/bugs/UX gaps found by dogfooding
-  the server end-to-end (each finding `F#` has repro, severity, and a fix with
-  code pointers). Read it before touching the tool surface.
+Findings carry stable `F#` IDs that cross-reference across the three docs below.
+As a finding's state changes, **move** it to the right file (don't duplicate) — a
+single `F#` may appear in two files (wrapper-resolved *and* its upstream remainder).
+
+- `docs/dogfooding.md` — running log of *open* quirks/bugs/UX gaps found by
+  dogfooding the server end-to-end. Read it before touching the tool surface.
+- `docs/previous_issues.md` — dogfooding findings already **resolved in the
+  wrapper**, each with its resolution and code pointer. Check here before
+  re-investigating a finding that looks fixed.
 - `docs/just-prs-pending-fixes.md` — the subset of those findings that need an
   **upstream `just-prs` library** change (or real-data verification) before the
   wrapper can fully resolve them; each notes the defensive wrapper mitigation
