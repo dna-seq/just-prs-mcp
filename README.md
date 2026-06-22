@@ -50,9 +50,11 @@ The server **boots with no environment configured.**
 | `score_info` | essentials | Cleaned metadata for one PGS ID |
 | `best_performance` | essentials | Best evaluation metrics (OR/HR/AUROC/C-index) |
 | `search_traits` | essentials | REST trait search |
-| `trait_info` | essentials | Trait by EFO ID + associated PGS IDs |
+| `trait_info` | essentials | Trait by EFO/MONDO ID + associated PGS IDs |
+| `download_sample_genome` | essentials | Fetch a public sample WGS VCF from Zenodo (background task) |
 | `normalize_vcf` | essentials | VCF → genotype Parquet (background task) |
 | `compute_prs` | essentials | Score one VCF against one PGS |
+| `compute_prs_by_trait` | essentials | Score one VCF against all of a trait's PGS (background task) |
 | `percentile` | essentials | Percentile of a PRS value (reference/theoretical/AUROC) |
 | `absolute_risk` | essentials | Absolute disease risk from a PRS z-score |
 | `assess_quality` | essentials | Quality label + interpretation (pure logic) |
@@ -95,8 +97,52 @@ platformdirs). The HuggingFace upload tool reads `PRS_MCP_HF_TOKEN` or the nativ
 
 ## Using with coding agents
 
-`.mcp.json` (Claude Code) launches `uv run just-prs-mcp stdio`. For **Codex**
-(`~/.codex/config.toml`):
+### Published package — no clone needed (`uvx`)
+
+The server is on PyPI, so any MCP client can launch it with
+[`uvx`](https://docs.astral.sh/uv/) — `uvx` fetches and runs it in an ephemeral
+environment, no install step. Add it to **Claude Code** on the fly:
+
+```bash
+claude mcp add just-prs -- uvx just-prs-mcp@latest stdio   # always newest
+claude mcp add just-prs -- uvx just-prs-mcp@0.1.1 stdio    # pinned (reproducible)
+claude mcp list                                            # → just-prs ... ✔ Connected
+```
+
+> **Pick a version tag.** `uvx` **caches the first version it resolves** for a
+> bare name, so `uvx just-prs-mcp` will keep running that cached build, *not*
+> whatever is newest. Use `@latest` to always fetch the newest on each run, or
+> `@<version>` to pin for reproducibility. A bare name is the worst of both —
+> avoid it.
+
+Restart/reconnect the session for the new tools to load. Equivalent `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "just-prs": {
+      "command": "uvx",
+      "args": ["just-prs-mcp@latest", "stdio"],
+      "env": { "PRS_MCP_MODE": "essentials" }
+    }
+  }
+}
+```
+
+For **Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.just-prs]
+command = "uvx"
+args = ["just-prs-mcp@latest", "stdio"]   # or pin: just-prs-mcp@0.1.1
+```
+
+Use `--mode extended` (or `PRS_MCP_MODE=extended`) to expose the full tool surface.
+
+### From a clone (development)
+
+The repo's `.mcp.json` launches the working tree via `uv run just-prs-mcp stdio`.
+Codex equivalent:
 
 ```toml
 [mcp_servers.just-prs]

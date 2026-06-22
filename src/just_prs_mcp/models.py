@@ -107,6 +107,17 @@ class PercentileResult(BaseModel):
         default=None,
         description="Human-readable warning explaining why the percentile is caveated.",
     )
+    z_score: float | None = Field(
+        default=None,
+        description="True z-score ((score − reference_mean)/reference_std) used for this "
+        "percentile — feed directly to absolute_risk instead of inverting the percentile.",
+    )
+    reference_mean: float | None = Field(
+        default=None, description="Reference-distribution mean used, when known."
+    )
+    reference_std: float | None = Field(
+        default=None, description="Reference-distribution SD used, when known."
+    )
 
 
 class TraitSummary(BaseModel):
@@ -132,6 +143,11 @@ class TraitScoreRow(BaseModel):
     variants_matched: int | None = Field(default=None, description="Matched scoring variants.")
     variants_total: int | None = Field(default=None, description="Total scoring variants.")
     match_rate: float | None = Field(default=None, description="Matched / total scoring variants.")
+    weight_mass_coverage: float | None = Field(
+        default=None,
+        description="Fraction of the score's effect-weight mass (Σ|β|) matched in this genome "
+        "(C_wt) — the scale-free coverage signal; rank/gate on this, not match_rate.",
+    )
     percentile: float | None = Field(default=None, description="Optional percentile estimate.")
     percentile_method: str | None = Field(default=None, description="Method used for percentile.")
     percentile_reliable: bool | None = Field(

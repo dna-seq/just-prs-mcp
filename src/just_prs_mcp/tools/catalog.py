@@ -164,8 +164,8 @@ def register_catalog(mcp: FastMCP, settings: Settings) -> None:
             beta_estimate=row.get("beta_estimate"),
             auroc_estimate=row.get("auroc_estimate"),
             cindex_estimate=row.get("cindex_estimate"),
-            effect_size=format_effect_size(row),
-            classification=format_classification(row),
+            effect_size=format_effect_size(row) or "",
+            classification=format_classification(row) or "",
         )
 
     @mcp.tool(annotations=ToolAnnotations(title="Search traits", **_READ_ONLY))

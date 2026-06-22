@@ -82,7 +82,7 @@ call and returns a friendly `OpResult(success=False)` if none is set.
   → return `OpResult(success=False)` (or a clear `ToolError` for `pgenlib`).
 - Server-side logs use stdlib `logging` and **must** go to stderr
   (`logging_setup.py`); client-facing messages use `ctx.info`/`ctx.report_progress`.
-- Pin to the **installed** just-prs API (currently 0.4.7) — verify signatures
+- Pin to the **installed** just-prs API (currently 0.4.8) — verify signatures
   against the installed wheel, not an unpublished source tree (they can diverge
   under the same version number). E.g. `PRSCatalog.compute_prs_batch` returns a
   `list[PRSResult]` and takes no `genotypes`/`memory_limit`.
@@ -121,8 +121,12 @@ single `F#` may appear in two files (wrapper-resolved *and* its upstream remaind
   **upstream `just-prs` library** change (or real-data verification) before the
   wrapper can fully resolve them; each notes the defensive wrapper mitigation
   already in place. Add new upstream-blocked items here, not just in code TODOs.
-  Current priority: **F15** (genome-wide scores match only ~50% of a full WGS
-  callset — harmonization/variant-matching audit).
+  Current priorities: **F15** (genome-wide scores match only ~50% of a full WGS
+  callset — harmonization/variant-matching audit; F13 ruled out RefCall, F18 ruled
+  out build, and **F22 is the leading lead: gVCF `END` reference blocks aren't
+  expanded to dose-0 genotypes**), **F19** (ancestry never surfaced/checked —
+  the top interpretability gap), and **F21** (make the trait report filterable —
+  wrapper-actionable; also proposes a `prs-trait-interpretation` skill).
 
 ## Optional extras
 

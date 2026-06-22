@@ -306,8 +306,11 @@ def register_extended(mcp: FastMCP, settings: Settings) -> None:
     )
     def absolute_risk_bundle(
         pgs_id: str,
-        z_score: float,
+        z_score: float | None = None,
+        score: float | None = None,
         sex: str | None = None,
+        ancestry: str = "EUR",
+        weight_mass_coverage: float | None = None,
     ) -> AbsoluteRiskBundle:
         """Compute every available absolute-risk estimate for a score, with agreement.
 
@@ -315,12 +318,29 @@ def register_extended(mcp: FastMCP, settings: Settings) -> None:
         method the data supports — OR-per-SD and AUC-bivariate (from best
         performance) and h²-liability (per ancestry/source from the heritability
         table) — and returns all estimates, a best pick, and how well they agree.
-        Each estimate carries the population-prevalence prior it used. ``z_score``
-        is the PRS in SDs from the population mean. Returns an empty bundle when the
-        prevalence prior is unavailable.
+        Each estimate carries the population-prevalence prior it used.
+
+        Provide **either** ``z_score`` (the PRS in SDs from the population mean) or
+        a raw ``score`` from ``compute_prs``. With a raw ``score`` the chain
+        resolves the **true** z-score via the reference panel (no lossy percentile
+        inversion) before computing risk; pass ``weight_mass_coverage`` (C_wt) and
+        ``ancestry`` to gate/locate that resolution. Returns an empty bundle when
+        the prevalence prior or z-score is unavailable.
         """
+        if z_score is None and score is None:
+            raise ToolError("Provide z_score or score.")
+        cat = client.make_catalog(settings)
         try:
-            return client.make_catalog(settings).absolute_risk_bundle(pgs_id, z_score, sex=sex)
+            if z_score is not None:
+                return cat.absolute_risk_bundle(pgs_id, z_score, sex=sex)
+            assert score is not None  # guaranteed by the validation above
+            return cat.absolute_risk_from_score(
+                pgs_id,
+                score,
+                ancestry=ancestry,
+                sex=sex,
+                weight_mass_coverage=weight_mass_coverage,
+            )
         except Exception as exc:  # noqa: BLE001
             raise ToolError(f"Absolute-risk bundle failed for {pgs_id}: {exc}") from exc
 

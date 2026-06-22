@@ -29,7 +29,7 @@ class FakeRestClient:
 
 
 class FakeCatalog:
-    def percentile(
+    def percentile_full(
         self,
         prs_score: float,
         pgs_id: str,
@@ -37,8 +37,28 @@ class FakeCatalog:
         mean: float = 0.0,
         std: float | None = None,
         panel: str = "1000g",
-    ) -> tuple[float | None, str]:
-        return 0.0, "reference_panel"
+        weight_mass_coverage: float | None = None,
+    ):
+        from just_prs.models import PercentileResult
+
+        # Mirror the library: a low C_wt flips reliability and attaches a caveat.
+        reliable = True
+        caveat = ""
+        if weight_mass_coverage is not None and weight_mass_coverage < 0.20:
+            reliable = False
+            caveat = (
+                f"Only {weight_mass_coverage * 100:.0f}% of this score's effect-weight "
+                "mass was matched in this genome (C_wt)."
+            )
+        return PercentileResult(
+            percentile=0.0,
+            method="reference_panel",
+            z_score=-3.5,
+            reference_mean=0.0,
+            reference_std=1.0,
+            reliable=reliable,
+            caveat=caveat,
+        )
 
 
 def _trait(trait_id: str = "MONDO_0005148") -> TraitInfo:
@@ -97,19 +117,23 @@ async def test_search_traits_can_return_full_pgs_id_arrays(essentials_client, mo
     assert result.data[0].child_associated_pgs_ids == ["PGS000003"]
 
 
-async def test_percentile_low_match_rate_is_unreliable(essentials_client, monkeypatch):
+async def test_percentile_low_coverage_is_unreliable(essentials_client, monkeypatch):
+    """F9/F20: a low weight-mass coverage (C_wt) flags the percentile unreliable,
+    and the true z-score / reference stats are surfaced (F12)."""
     from just_prs_mcp import client as mcp_client
 
     monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeCatalog())
 
     result = await essentials_client.call_tool(
         "percentile",
-        {"prs_score": 14.944, "pgs_id": "PGS000014", "match_rate": 0.374},
+        {"prs_score": 14.944, "pgs_id": "PGS000014", "weight_mass_coverage": 0.15},
     )
 
     assert result.data.percentile == 0.0
     assert result.data.reliable is False
-    assert "Match rate" in result.data.caveat
+    assert "C_wt" in result.data.caveat
+    assert result.data.z_score == -3.5
+    assert result.data.reference_std == 1.0
 
 
 class FakeReportRest:
@@ -139,7 +163,7 @@ class FakeBatchCatalog:
 
     _RATES = {"PGS000001": 0.95, "PGS000002": 0.40, "PGS000003": 0.70}
 
-    def compute_prs_batch(self, vcf_path, pgs_ids, genome_build):
+    def compute_prs_batch(self, vcf_path, pgs_ids, genome_build, attach_performance=False):
         from just_prs.models import PRSResult
 
         return [
@@ -176,6 +200,118 @@ async def test_compute_prs_by_trait_top_n_trims_and_ranks(essentials_client, mon
     # Ranked best-coverage first; the 0.40 score is trimmed, not an arbitrary one.
     assert [row.pgs_id for row in report.rows] == ["PGS000001", "PGS000003"]
     assert report.mean_match_rate == pytest.approx((0.95 + 0.40 + 0.70) / 3)
+
+
+class FakePerfCatalog:
+    """Batch catalog that attaches PerformanceInfo when asked; no best_performance method,
+    so any per-score round-trip fallback would raise (and surface as a regression)."""
+
+    def compute_prs_batch(self, vcf_path, pgs_ids, genome_build, attach_performance=False):
+        from just_prs.models import EffectSizeInfo, PerformanceInfo, PRSResult
+
+        out = []
+        for pgs_id in pgs_ids:
+            perf = None
+            if attach_performance:
+                perf = PerformanceInfo(
+                    ppm_id="PPM1",
+                    effect_sizes=[
+                        EffectSizeInfo(name_short="OR", estimate=1.55, ci_lower=1.50, ci_upper=1.60)
+                    ],
+                    class_acc=[EffectSizeInfo(name_short="AUROC", estimate=0.78)],
+                    sample_number=1000,
+                    ancestry_broad="European",
+                )
+            out.append(
+                PRSResult(
+                    pgs_id=pgs_id,
+                    score=1.0,
+                    variants_matched=900,
+                    variants_total=1000,
+                    match_rate=0.9,
+                    weight_mass_coverage=0.85,
+                    performance=perf,
+                )
+            )
+        return out
+
+    def percentile_full(
+        self, prs_score, pgs_id, ancestry="EUR", mean=0.0, std=None, panel="1000g",
+        weight_mass_coverage=None,
+    ):
+        from just_prs.models import PercentileResult
+
+        return PercentileResult(
+            percentile=82.0, method="reference_panel", z_score=0.9,
+            reference_mean=0.0, reference_std=1.0, reliable=True, caveat="",
+        )
+
+
+async def test_compute_prs_by_trait_attaches_performance(essentials_client, monkeypatch, tmp_path):
+    """F11: interpret=True reads the batch-attached performance (auroc + effect size) and
+    C_wt (F9/F20) without a per-score best_performance round-trip."""
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_rest_client", FakeReportRest)
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakePerfCatalog())
+
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text("##fileformat=VCFv4.2\n")
+
+    result = await essentials_client.call_tool(
+        "compute_prs_by_trait",
+        {"trait_id": "MONDO_0005148", "vcf_path": str(vcf), "interpret": True},
+    )
+    rows = result.data.rows
+
+    assert rows and all(r.auroc_estimate == 0.78 for r in rows)
+    assert all(r.effect_size == "OR=1.55 [1.50-1.60]" for r in rows)
+    assert all(r.weight_mass_coverage == 0.85 for r in rows)
+    assert all(r.percentile == 82.0 and r.percentile_reliable for r in rows)
+
+
+class FakeRiskFromScoreCatalog:
+    """Records how absolute_risk_bundle routed: raw score vs z-score."""
+
+    def __init__(self) -> None:
+        self.from_score_args: dict | None = None
+
+    def absolute_risk_from_score(
+        self, pgs_id, score, ancestry="EUR", sex=None, weight_mass_coverage=None, panel="1000g"
+    ):
+        from just_prs.models import AbsoluteRiskBundle
+
+        self.from_score_args = {
+            "pgs_id": pgs_id, "score": score, "ancestry": ancestry,
+            "weight_mass_coverage": weight_mass_coverage,
+        }
+        return AbsoluteRiskBundle(agreement="single")
+
+
+async def test_absolute_risk_bundle_from_raw_score(extended_client, monkeypatch):
+    """F12: a raw score routes through absolute_risk_from_score (true-z chain), no
+    caller-supplied z-score needed."""
+    from just_prs_mcp import client as mcp_client
+
+    fake = FakeRiskFromScoreCatalog()
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: fake)
+
+    result = await extended_client.call_tool(
+        "absolute_risk_bundle",
+        {"pgs_id": "PGS000014", "score": 14.9, "weight_mass_coverage": 0.85},
+    )
+
+    assert result.data.agreement == "single"
+    assert fake.from_score_args == {
+        "pgs_id": "PGS000014", "score": 14.9, "ancestry": "EUR", "weight_mass_coverage": 0.85,
+    }
+
+
+async def test_absolute_risk_bundle_requires_score_or_z(extended_client):
+    from fastmcp.exceptions import ToolError
+
+    with pytest.raises(ToolError):
+        await extended_client.call_tool("absolute_risk_bundle", {"pgs_id": "PGS000014"})
 
 
 async def test_download_sample_genome_unknown_sample_is_recoverable(essentials_client):

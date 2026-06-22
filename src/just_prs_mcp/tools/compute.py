@@ -73,37 +73,66 @@ def _percentile_result(
     pgs_id: str,
     superpopulation: str,
     panel: str | None,
-    match_rate: float | None = None,
+    weight_mass_coverage: float | None = None,
 ) -> PercentileResult:
-    pct, method = client.make_catalog(settings).percentile(
+    """Wrap just-prs ``percentile_full`` — the library owns the reliability verdict.
+
+    Passing ``weight_mass_coverage`` (C_wt) lets the library flag a deflated
+    low-coverage percentile as ``reliable=False`` with a caveat (gate is C_wt, not
+    the old match-rate heuristic). The true z-score / reference mean+std it used are
+    surfaced so callers can feed absolute risk without inverting the percentile.
+    """
+    res = client.make_catalog(settings).percentile_full(
         prs_score=prs_score,
         pgs_id=pgs_id,
         ancestry=superpopulation,
         panel=client.panel(settings, panel),
+        weight_mass_coverage=weight_mass_coverage,
     )
-    reliable = True
-    caveat = None
-    if match_rate is not None and match_rate < 0.9:
+    reliable = res.reliable
+    caveat = res.caveat or None
+    # When no coverage signal is supplied the library cannot judge reliability, so keep a
+    # lightweight guard so a bare extreme percentile is not read as authoritative.
+    if reliable and weight_mass_coverage is None and res.percentile in (0, 100):
         reliable = False
         caveat = (
-            f"Match rate is {match_rate:.1%}; percentile may be a coverage artifact. "
-            "Confirm genome build and missing/ref-call handling before interpreting."
-        )
-    elif pct in (0, 100):
-        reliable = False
-        caveat = (
-            "Extreme percentile returned. Interpret cautiously unless the scoring variant "
-            "match rate is high and the genome build is confirmed."
+            "Extreme percentile (0/100) returned with no coverage signal. Pass "
+            "weight_mass_coverage (C_wt from compute_prs) to confirm this is not a "
+            "low-coverage artifact."
         )
     return PercentileResult(
         pgs_id=pgs_id,
         prs_score=prs_score,
-        percentile=pct,
-        method=method,
+        percentile=res.percentile,
+        method=res.method,
         ancestry=superpopulation,
         reliable=reliable,
         caveat=caveat,
+        z_score=res.z_score,
+        reference_mean=res.reference_mean,
+        reference_std=res.reference_std,
     )
+
+
+def _auroc_from_performance(performance) -> float | None:
+    """Pull the AUROC estimate out of a library ``PerformanceInfo`` (else None)."""
+    if performance is None:
+        return None
+    for metric in performance.class_acc:
+        if metric.name_short == "AUROC":
+            return metric.estimate
+    return None
+
+
+def _format_effect_size(performance) -> str | None:
+    """Format the primary effect size of a ``PerformanceInfo``, e.g. 'OR=1.55 [1.52-1.58]'."""
+    if performance is None or not performance.effect_sizes:
+        return None
+    e = performance.effect_sizes[0]
+    text = f"{e.name_short}={e.estimate:.2f}"
+    if e.ci_lower is not None and e.ci_upper is not None:
+        text += f" [{e.ci_lower:.2f}-{e.ci_upper:.2f}]"
+    return text
 
 
 def _best_performance_summary(settings: Settings, pgs_id: str) -> PerformanceSummary:
@@ -125,7 +154,7 @@ def _best_performance_summary(settings: Settings, pgs_id: str) -> PerformanceSum
         auroc_estimate=row.get("auroc_estimate"),
         cindex_estimate=row.get("cindex_estimate"),
         effect_size=effect_size or "",
-        classification=format_classification(row),
+        classification=format_classification(row) or "",
     )
 
 
@@ -138,7 +167,8 @@ def _trait_score_row(
 ) -> TraitScoreRow:
     percentile_result = None
     quality = None
-    performance = None
+    auroc = None
+    effect_size = None
     if interpret:
         try:
             percentile_result = _percentile_result(
@@ -147,18 +177,32 @@ def _trait_score_row(
                 pgs_id=result.pgs_id,
                 superpopulation=superpopulation,
                 panel=panel,
-                match_rate=result.match_rate,
+                weight_mass_coverage=result.weight_mass_coverage,
             )
         except Exception:  # noqa: BLE001 - interpretation is best-effort in aggregate reports
             percentile_result = None
         try:
-            performance = _best_performance_summary(settings, result.pgs_id)
+            # Prefer the performance the batch attached (attach_performance=True) — no
+            # per-score round-trip. Fall back to a lookup only for the low-level
+            # genotypes_path branch, which can't attach it.
+            if result.performance is not None:
+                auroc = _auroc_from_performance(result.performance)
+                effect_size = _format_effect_size(result.performance)
+            else:
+                summary = _best_performance_summary(settings, result.pgs_id)
+                auroc = summary.auroc_estimate
+                effect_size = summary.effect_size or None
         except Exception:  # noqa: BLE001 - interpretation is best-effort in aggregate reports
-            performance = None
+            auroc, effect_size = None, None
         quality = _quality_assessment(
             match_rate=result.match_rate,
-            auroc=performance.auroc_estimate if performance else None,
+            auroc=auroc,
             percentile=percentile_result.percentile if percentile_result else result.percentile,
+            percentile_method=(
+                percentile_result.method if percentile_result else result.percentile_method
+            ),
+            reliable=percentile_result.reliable if percentile_result else True,
+            caveat=(percentile_result.caveat or "") if percentile_result else "",
         )
 
     return TraitScoreRow(
@@ -168,6 +212,7 @@ def _trait_score_row(
         variants_matched=result.variants_matched,
         variants_total=result.variants_total,
         match_rate=result.match_rate,
+        weight_mass_coverage=result.weight_mass_coverage,
         percentile=percentile_result.percentile if percentile_result else result.percentile,
         percentile_method=(
             percentile_result.method if percentile_result else result.percentile_method
@@ -176,10 +221,8 @@ def _trait_score_row(
         percentile_caveat=percentile_result.caveat if percentile_result else None,
         quality_label=quality.quality_label if quality else None,
         quality_summary=quality.summary if quality else None,
-        effect_size=(
-            None if not performance or not performance.effect_size else performance.effect_size
-        ),
-        auroc_estimate=performance.auroc_estimate if performance else None,
+        effect_size=effect_size,
+        auroc_estimate=auroc,
     )
 
 
@@ -227,16 +270,18 @@ def _zenodo_download_url(file_entry: dict) -> str | None:
     return links.get("content") or links.get("download") or links.get("self")
 
 
-def _row_rank_key(row: TraitScoreRow) -> tuple[bool, bool, float]:
+def _row_rank_key(row: TraitScoreRow) -> tuple[bool, bool, float, float]:
     """Rank rows best-coverage first for ``top_n`` trimming (sorted reverse=True).
 
-    Scored rows outrank failed ones, reliable percentiles outrank unreliable, and
-    higher match rates win the tie — so a trimmed report keeps the most trustworthy
-    scores rather than an arbitrary prefix.
+    Scored rows outrank failed ones, reliable percentiles outrank unreliable, then
+    higher weight-mass coverage (C_wt, the scale-free signal) wins, with match rate
+    as the final tiebreak — so a trimmed report keeps the most trustworthy scores
+    rather than an arbitrary prefix.
     """
     return (
         row.status == "scored",
         bool(row.percentile_reliable),
+        row.weight_mass_coverage if row.weight_mass_coverage is not None else -1.0,
         row.match_rate if row.match_rate is not None else -1.0,
     )
 
@@ -245,21 +290,26 @@ def _quality_assessment(
     match_rate: float,
     auroc: float | None = None,
     percentile: float | None = None,
+    percentile_method: str | None = None,
+    reliable: bool = True,
+    caveat: str = "",
 ) -> QualityAssessment:
     from just_prs.quality import interpret_prs_result
 
-    interp = interpret_prs_result(percentile=percentile, match_rate=match_rate, auroc=auroc)
-    summary = interp.get("summary", "")
-    if percentile is not None and "percentile not available" in summary.lower():
-        summary = (
-            f"Percentile {percentile:.1f} was provided separately; "
-            "use percentile reliability caveats for availability and coverage context. "
-            f"{summary}"
-        )
+    # The library now derives the summary from the actual percentile method and
+    # appends the caveat when unreliable, so the wrapper no longer patches its text.
+    interp = interpret_prs_result(
+        percentile=percentile,
+        match_rate=match_rate,
+        auroc=auroc,
+        percentile_method=percentile_method,
+        reliable=reliable,
+        caveat=caveat,
+    )
     return QualityAssessment(
         quality_label=interp.get("quality_label", ""),
         quality_color=interp.get("quality_color", ""),
-        summary=summary,
+        summary=interp.get("summary", ""),
     )
 
 
@@ -431,14 +481,22 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         pgs_id: str,
         genome_build: str | None = None,
         genotypes_path: str | None = None,
+        attach_performance: bool = False,
     ) -> PRSResult:
         """Compute a polygenic risk score for one VCF against one PGS score.
 
         Downloads the harmonized scoring file (cached) and scores the genotypes.
         Pass ``genotypes_path`` to reuse a normalized Parquet from ``normalize_vcf``
         (avoids re-reading the VCF); otherwise the VCF is read directly. Returns
-        the score, match rate, variant counts, trait, and (when data permits) a
-        theoretical percentile.
+        the score, match rate, variant counts, weight-mass coverage (C_wt), trait,
+        and (when data permits) a theoretical percentile.
+
+        Set ``attach_performance=True`` to embed the score's best published
+        performance (effect sizes, AUROC/C-index, evaluation ancestry) on the
+        result in the same call — no separate ``best_performance`` round-trip.
+        (Not honored on the ``genotypes_path`` reuse branch: ``PRSCatalog.compute_prs``
+        has no ``genotypes_lf`` yet — upstream gap, see
+        ``docs/just-prs-pending-fixes.md`` F23.)
         """
         b = client.build(settings, genome_build)
         cat = client.make_catalog(settings)
@@ -461,7 +519,12 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                     genotypes_lf=pl.scan_parquet(gpath),
                 )
             _require_file(vcf_path, "VCF")
-            return cat.compute_prs(vcf_path=vcf_path, pgs_id=pgs_id, genome_build=b)
+            return cat.compute_prs(
+                vcf_path=vcf_path,
+                pgs_id=pgs_id,
+                genome_build=b,
+                attach_performance=attach_performance,
+            )
         except ToolError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -476,11 +539,14 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         pgs_ids: list[str],
         ctx: Context,
         genome_build: str | None = None,
+        attach_performance: bool = False,
     ) -> list[PRSResult]:
         """Compute PRS for one VCF against many PGS scores (background task).
 
         Memory-safe DuckDB engine with spill-to-disk; reuses the parsed VCF and
-        scoring caches across scores. Returns one result per PGS ID.
+        scoring caches across scores. Returns one result per PGS ID. Set
+        ``attach_performance=True`` to embed each score's best published
+        performance on its result in the same pass.
         """
         b = client.build(settings, genome_build)
         cat = client.make_catalog(settings)
@@ -488,7 +554,12 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
 
         await ctx.info(f"Batch-scoring {len(pgs_ids)} PGS IDs against {Path(vcf_path).name}")
         results = await run_sync(
-            lambda: cat.compute_prs_batch(vcf_path=vcf_path, pgs_ids=pgs_ids, genome_build=b)
+            lambda: cat.compute_prs_batch(
+                vcf_path=vcf_path,
+                pgs_ids=pgs_ids,
+                genome_build=b,
+                attach_performance=attach_performance,
+            )
         )
         await ctx.info(f"Computed {len(results)} score(s)")
         return results
@@ -586,6 +657,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                         vcf_path=vcf_path,
                         pgs_ids=selected_ids,
                         genome_build=b,
+                        attach_performance=interpret,
                     )
                 )
                 by_id = {result.pgs_id: result for result in results}
@@ -661,15 +733,18 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         pgs_id: str,
         superpopulation: str = "EUR",
         panel: str | None = None,
-        match_rate: float | None = None,
+        weight_mass_coverage: float | None = None,
     ) -> PercentileResult:
         """Estimate the population percentile (0-100) for a computed PRS value.
 
         Uses the 3-tier fallback: precomputed reference-panel distributions
         (best), then a theoretical distribution, then an AUROC approximation.
         ``superpopulation`` is a 1000G code (AFR/AMR/EAS/EUR/SAS). Pass
-        ``match_rate`` from ``compute_prs`` so low-coverage or extreme percentile
-        outputs can be flagged as unreliable instead of presented bare.
+        ``weight_mass_coverage`` (C_wt) from ``compute_prs`` so a deflated
+        low-coverage percentile is flagged ``reliable=False`` with a caveat
+        instead of presented as authoritative. Also returns the true z-score and
+        reference mean/std used, so absolute risk can be computed without
+        inverting the percentile.
         """
         try:
             return _percentile_result(
@@ -678,7 +753,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                 pgs_id=pgs_id,
                 superpopulation=superpopulation,
                 panel=panel,
-                match_rate=match_rate,
+                weight_mass_coverage=weight_mass_coverage,
             )
         except Exception as exc:  # noqa: BLE001
             raise ToolError(f"Percentile estimation failed for {pgs_id}: {exc}") from exc
@@ -709,14 +784,27 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         match_rate: float,
         auroc: float | None = None,
         percentile: float | None = None,
+        percentile_method: str | None = None,
+        reliable: bool = True,
+        caveat: str = "",
     ) -> QualityAssessment:
         """Classify and interpret a PRS result's quality (pure logic — no I/O).
 
         ``match_rate`` is the fraction of scoring variants matched (0-1). Returns
         a quality label/color and a human-readable interpretation combining match
-        rate, AUROC, and (optionally) the result percentile.
+        rate, AUROC, and (optionally) the result percentile. Pass
+        ``percentile_method`` / ``reliable`` / ``caveat`` from the ``percentile``
+        tool so the summary describes how the percentile was actually derived and
+        echoes any low-coverage caveat.
         """
-        return _quality_assessment(match_rate=match_rate, auroc=auroc, percentile=percentile)
+        return _quality_assessment(
+            match_rate=match_rate,
+            auroc=auroc,
+            percentile=percentile,
+            percentile_method=percentile_method,
+            reliable=reliable,
+            caveat=caveat,
+        )
 
     @mcp.resource("resource://prs/panels")
     def panels() -> str:
