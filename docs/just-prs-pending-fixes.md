@@ -4,6 +4,21 @@ These findings came from `docs/dogfooding.md`. They need changes in the
 underlying `just-prs` library or real-data verification before the MCP wrapper can
 fully resolve them. The wrapper now includes defensive mitigations where possible.
 
+> **2026-06-22 upstream sweep.** `just-prs` **0.4.8** was published and pinned. Its
+> RESOLVED foundations items — **F9** (reliability metadata), **F10**, **F11**, **F12**
+> — were verified against the installed wheel and **moved to `docs/previous_issues.md`**.
+> What remains below is genuinely still pending/deferred upstream. F9's coverage
+> *normalization* remainder is tracked under **F15**; F20 keys on the now-shipped C_wt
+> metric but its composite-quality gate is still future work.
+>
+> **2026-06-22 Batch 2 (post-0.4.8, in `just-prs` `main`, NOT yet released/pinned).**
+> **F4** (genome-build detection + `build_mismatch`) and **F23** (`genotypes_lf` on
+> `PRSCatalog.compute_prs`) are now **RESOLVED in `main`**, and **F19** is now
+> **PARTIALLY RESOLVED** (percentile reference-panel ancestry surfaced; sample-ancestry
+> inference + coherence veto still deferred). These need the next `just-prs` release +
+> wrapper pin before they can be relied on at runtime — verify against the wheel and move
+> to `previous_issues.md` then, same as the 0.4.8 sweep.
+
 ## F2 — Trait search should be tokenized/fuzzy
 
 **Status: PENDING (not addressed in `just-prs` `main`).** No library change yet; the
@@ -23,11 +38,16 @@ candidates when no exact substring matches.
 
 ## F4 — Genome build inference and echo-back
 
-**Status: DEFERRED (not in `just-prs` `main`).** Scoped into the original
-scoring-foundations plan but cut to keep that round strictly additive for the demo;
-contig-length build detection in `normalize_vcf` + an effective-build echo + a
-build-mismatch warning on the result are still to be implemented. Wrapper echo-back
-remains the only mitigation.
+**Status: RESOLVED in `just-prs` `main` (Batch 2, 2026-06-22) — post-0.4.8, pending the
+next release/pin.** `compute_prs` / `compute_prs_duckdb` now call the existing
+`just_prs.vcf.detect_genome_build()` (contig-length + `##reference` voting) and surface
+`detected_genome_build` + `build_mismatch` on `PRSResult` (and `EnrichedPRSResult`),
+logging an Eliot warning on mismatch. Guarded: detection only runs on a real,
+VCF-suffixed, existing file — a pre-normalized Parquet/array/empty-path input yields
+`detected_genome_build=None` and `build_mismatch=False` (never a false mismatch it can't
+prove from a header). *What to expect:* read `result.build_mismatch` to catch a VCF
+scored against the wrong build; `None` detected build means "couldn't tell," not "match."
+**Not yet in published 0.4.8** — bump/pin the next release to consume it.
 
 The WGS VCF had no `##reference` header; GRCh38 was only inferable from contig
 lengths. `just-prs` currently relies on the caller/config default, and a build
@@ -39,171 +59,6 @@ Wrapper mitigation: normalization and trait reports now echo the effective
 Library fix: infer genome build from contig metadata where possible, include the
 effective build in `PRSResult`, and warn when the inferred VCF build disagrees
 with the scoring build.
-
-## F9 — Low-coverage percentiles need normalization or reliability metadata
-
-**Status: RESOLVED (reliability metadata) in `just-prs` `main`, 2026-06-22.**
-Coverage *normalization/recovery* is separately DEFERRED (see F15).
-
-*What was addressed.* The library never told the caller whether a percentile was
-trustworthy, so a score that matched only 37% of its variants could still emit an
-authoritative `percentile=0` — an artifact of the deflated raw score, not biology.
-
-*How exactly.* Two additive changes. (1) `PRSResult` now carries **weight-mass
-coverage** `C_wt` as `weight_mass_coverage` (plus the raw `weight_mass_matched` /
-`weight_mass_total`), computed in both the polars and DuckDB engines as
-`Σ|βᵢ|(matched) / Σ|βᵢ|(all scoring variants)` — the fraction of the score's total
-effect-weight mass actually carried by matched variants, not a count fraction.
-(2) `PRSCatalog.percentile_full()` (new) returns a `PercentileResult` with a
-`reliable: bool` + `caveat: str` verdict: when the caller passes the result's
-`weight_mass_coverage` and it falls below `MIN_RELIABLE_WEIGHT_MASS_COVERAGE` (0.20),
-the percentile value is **kept** but flagged `reliable=False` with a plain-language
-caveat, so a deflated low-coverage score no longer reads as an authoritative 0/100.
-The pre-existing count-based `MIN_PERCENTILE_MATCH_RATE` gate in `enrich.py` is left
-unchanged — the C_wt verdict is purely additive.
-
-*What to expect from new just-prs.* Read `result.weight_mass_coverage` for a scale-free
-coverage signal, and call `catalog.percentile_full(score, pgs_id,
-weight_mass_coverage=result.weight_mass_coverage)` to get `percentile`, `method`,
-`reliable`, and `caveat` in one object. The wrapper's own `reliable=false` mitigation
-can now be backed by (or replaced with) the library's `C_wt`-driven verdict rather than
-match-rate heuristics. Raw scores are **not** coverage-normalized yet (that needs the
-F15 reference-allele recovery), so a low-`C_wt` percentile is still a deflated estimate —
-just now explicitly labelled as such.
-
-A PRS with `match_rate=0.374` returned `percentile=0` from a reference-panel
-comparison. The raw score is deflated when unmatched loci are treated as zero, so
-the percentile can become an artifact of coverage rather than biology.
-
-Wrapper mitigation: the MCP `percentile` tool accepts `match_rate` and returns
-`reliable=false` plus a caveat for low match rates or bare extreme percentiles.
-
-Library fix: either normalize raw scores by scoring-variant coverage before
-reference-panel comparison, or return explicit reliability/caveat metadata from
-`PRSCatalog.percentile`. Avoid emitting authoritative `0`/`100` percentiles for
-low-coverage scores.
-
-## F10 — Quality interpretation should know percentile method availability
-
-**Status: RESOLVED in `just-prs` `main`, 2026-06-22.**
-
-*What was addressed.* `interpret_prs_result` hard-coded two false statements: it always
-attributed a present percentile to "theoretical, from allele frequencies in the scoring
-file," and when the percentile was `None` it claimed "no allele frequencies in scoring
-file — percentile not available" even when a reference-panel percentile existed for that
-score. Both contradicted what `PRSCatalog.percentile` actually returned.
-
-*How exactly.* `interpret_prs_result(percentile, match_rate, auroc)` gained three
-optional, backward-compatible parameters: `percentile_method`, `reliable`, and `caveat`.
-The summary now describes the *actual* derivation via a method→phrase map
-(`reference_panel` → "from a reference-panel population distribution", `theoretical` →
-"from allele frequencies in the scoring file", `auroc_approx` → "an AUROC-based
-approximation"); when `reliable=False` it appends the `caveat`; and the
-percentile-unavailable sentence is now generic ("No population percentile is available
-for this score — compare to a matched reference cohort") instead of blaming allele
-frequencies. `enrich.py` passes the real method/reliability through from
-`percentile_full`.
-
-*What to expect from new just-prs.* Pass `percentile_method` (and `reliable`/`caveat`)
-into `interpret_prs_result` and the summary text will be consistent with whichever
-percentile method actually ran. The wrapper no longer needs to suppress the library's
-availability statement when it supplied a percentile separately — the library only
-makes claims consistent with its inputs.
-
-`interpret_prs_result` can say a percentile is unavailable because allele
-frequencies are missing, while `PRSCatalog.percentile` returns a reference-panel
-percentile for the same score.
-
-Wrapper mitigation: the MCP quality path avoids treating percentile availability
-as authoritative when a percentile was supplied separately; the percentile tool is
-the source of reliability/caveat messaging.
-
-Library fix: update `interpret_prs_result` to accept the percentile method and
-reliability/caveat state, or narrow it to quality classification only and leave
-availability statements to percentile computation.
-
-## F11 — PRS computation should attach best performance when available
-
-**Status: RESOLVED in `just-prs` `main`, 2026-06-22.**
-
-*What was addressed.* `compute_prs` returned `performance=null` even when
-`best_performance()` had AUROC/OR data for that score, forcing the caller to make a
-second call and stitch it in by hand. Separately, `format_effect_size` /
-`format_classification` returned an empty string when no estimate existed, which is
-indistinguishable from a real empty value.
-
-*How exactly.* `PRSCatalog.compute_prs` and `compute_prs_batch` gained an opt-in
-`attach_performance: bool = False`. When True, a new `_attach_performance()` helper
-looks up the score's `best_performance()` row and builds a `PerformanceInfo`
-(`_performance_info_from_row`) — populating OR/HR/Beta effect sizes, AUROC/C-index
-classification metrics, evaluation `ancestry_broad`, and sample number — onto
-`PRSResult.performance`. Default stays `False` so the raw, network-light result
-contract is unchanged for callers who don't want the extra lookup. `format_effect_size`
-and `format_classification` now return `str | None`, returning `None` (not `""`) when no
-metric exists; `enrich.py` coalesces to `""` only at the display layer.
-
-*What to expect from new just-prs.* Call `compute_prs(..., attach_performance=True)`
-(or the batch variant) to get score + best performance in one composed `PRSResult` —
-no separate `best_performance()` round-trip. When checking an effect size, treat `None`
-as "no estimate available" and a string as a real value.
-
-`compute_prs(PGS000014)` returned `performance=null`, while
-`best_performance(PGS000014)` found AUROC data. Users currently need a separate
-call and manual handoff into quality assessment.
-
-Wrapper mitigation: trait-level reports optionally fetch best performance per
-score when `interpret=true`.
-
-Library fix: optionally embed best-performance metadata in `PRSResult`, or expose
-a convenience path that returns score, percentile, performance, and quality as one
-composed result. Also prefer `null` over an empty `effect_size` string when no
-effect-size estimate exists.
-
-## F12 — Absolute risk needs a raw-score to z-score path
-
-**Status: RESOLVED in `just-prs` `main`, 2026-06-22.**
-
-*What was addressed.* `absolute_risk` required a z-score as input, but `compute_prs`
-returned only a raw score and `PRSCatalog.percentile` computed `z = (score − mean)/std`
-internally and **threw it away** (returning only `(percentile, method)`). The
-enrichment layer then reconstructed z by *inverting* the percentile
-(`_norm_ppf(pct/100)`), which is lossy — it rounds and, worse, clamps to `z=0` at the
-0/100 extremes, so low-coverage artifact percentiles silently produced
-population-average risk.
-
-*How exactly.* (1) New `PercentileResult` model + `PRSCatalog.percentile_full(...)`
-return the **true** `z_score`, `reference_mean`, and `reference_std` actually used
-(across all three tiers: reference panel, theoretical, AUROC-approx). The old
-`percentile()` is now a thin back-compat wrapper returning the same `(percentile,
-method)` tuple. (2) `PRSResult` carries `z_score` / `reference_mean` / `reference_std`
-directly on the theoretical path. (3) New
-`PRSCatalog.absolute_risk_from_score(pgs_id, score, ancestry=..., sex=..., weight_mass_coverage=...)`
-chains raw score → `percentile_full` (true z) → `absolute_risk_bundle` in one call.
-(4) `enrich.py` now feeds the true z into absolute risk and only falls back to the
-percentile inversion when no true z is available.
-
-*What to expect from new just-prs.* The raw-score → z → absolute-risk gap is closed
-end-to-end with no manual wiring: call `absolute_risk_from_score()` for the full chain,
-or read `z_score` / `reference_mean` / `reference_std` off `percentile_full()` /
-`PRSResult` if you want the intermediate. Risk numbers at the distribution extremes are
-now correct (no more silent collapse to the population mean). The wrapper's z-score
-limitation is removed — it no longer needs the library to expose distribution params
-separately.
-
-`absolute_risk` requires a z-score, but `compute_prs` returns a raw score and
-`percentile` does not expose the z-score or reference mean/std it used.
-
-Wrapper mitigation: no reliable wrapper-only z-score can be produced without the
-library exposing reference distribution parameters. The *prevalence prior* side of
-absolute risk is now fully exposed in extended mode — `prevalence_info` surfaces
-just-prs's prevalence table for a score/trait (value, bounds, type, scope, source,
-confidence) without needing a z-score, and `absolute_risk_bundle` returns every
-method's estimate with the prior it used. The remaining gap is purely the
-raw-score → z-score step.
-
-Library fix: return the derived `z_score` plus reference mean/std from
-`percentile`, or add `absolute_risk_from_score` that chains raw PRS to z-score to
-absolute risk.
 
 ## F13 — RefCall/hom-ref handling — TESTED & RULED OUT
 
@@ -328,11 +183,17 @@ audit in F15.
 
 ## F19 — Ancestry is never surfaced or checked (development ancestry + reference-panel ancestry) — PRIORITY
 
-**Status: PENDING / DEFERRED (not in `just-prs` `main`; design-only, roadmap P3).**
-Surfacing per-score development/evaluation ancestry on `ScoreInfo`, echoing the
-percentile reference-panel ancestry, and the 3-way coherence/veto check are scoped in
-the roadmap but not implemented. The wrapper-side panel-ancestry mitigation remains the
-only thing in play.
+**Status: PARTIALLY RESOLVED — the percentile reference-panel ancestry now ships from
+the library; the rest stays DEFERRED.** In `just-prs` `main` (Batch 2, 2026-06-22;
+post-0.4.8, pending release): `PercentileResult` carries `ancestry` + `panel` (the
+superpopulation/panel actually used by the `reference_panel` method) and
+`EnrichedPRSResult` echoes `reference_panel_ancestry` / `reference_panel`. Evaluation
+ancestry (`ancestry_broad`) already flows via `PerformanceInfo` (F11 / `attach_performance`).
+*Still DEFERRED (roadmap P3, research):* per-score **development** ancestry from the PGS
+Catalog "Ancestry Distribution" metadata, **sample** genetic-ancestry inference (plink2
+projection / peddy / somalier), and the 3-way coherence **veto** (`K_anc`). So the
+wrapper can now name *which* reference population a percentile came from, but the
+score-vs-sample-vs-panel mismatch check is not yet available from the library.
 
 The single largest interpretability gap. Many PGS Catalog T2D scores are developed
 for non-EUR ancestries (e.g. `DPRISM_…trainedforAFR`, PGS005334 = EAS), yet
@@ -355,8 +216,8 @@ it (tracked as a report column in dogfooding F21).
 
 ## F20 — Coverage reliability gate is absolute and perversely selects trivially small scores — extends F9/F15
 
-**Status: PARTIALLY RESOLVED in `just-prs` `main`, 2026-06-22.** The metric that inverts
-quality is fixed; the composite gate that consumes it is still future work.
+**Status: PARTIALLY RESOLVED — the inverting metric shipped in `just-prs` **0.4.8**
+(verified 2026-06-22); the composite gate that consumes it is still future work.**
 
 *What was addressed.* A flat count-based coverage gate ranked a fully-matched 3-SNP toy
 above a genome-wide AUROC-0.84 model at 50% count coverage — high count-coverage
@@ -368,7 +229,8 @@ contributes in proportion to `|β|`, so a 3-SNP score that misses one variant cr
 `C_wt`, whereas a genome-wide score whose matched variants carry most of `Σ|β|` scores
 well even at modest count coverage. `percentile_full`'s reliability verdict keys on
 `C_wt` (not the count match-rate), so the "trivially small score is the only reliable
-one" inversion no longer holds.
+one" inversion no longer holds. (The `C_wt` metric and `percentile_full` verdict are now
+confirmed shipped in 0.4.8 — see the F9 entry in `previous_issues.md`.)
 
 *What to expect from new just-prs.* Rank/gate on `weight_mass_coverage`, not
 `match_rate`, when judging whether a score is informative for an individual.
@@ -389,3 +251,46 @@ score near its achievable ceiling is more trustworthy than a 3-SNP score at 100%
 or add a distinct "high coverage but low information" flag so a near-null toy score
 isn't reported as the one trustworthy result. Pairs with the F15 coverage-normalized
 scoring.
+
+## F23 — `PRSCatalog.compute_prs` (single score) lacks `genotypes_lf`, so `attach_performance` is silently dropped on the normalized-Parquet reuse path — cheap
+
+**Status: RESOLVED in `just-prs` `main` (Batch 2, 2026-06-22) — post-0.4.8, pending the
+next release/pin.** `PRSCatalog.compute_prs` now takes `genotypes_lf` (mirroring
+`compute_prs_batch`), forwards it to the low-level compute, and runs `_attach_performance`
+itself — so a single score reuses a normalized Parquet **and** attaches best performance
+in one call. *What to expect / wrapper follow-up:* once the wrapper pins the release with
+this change, drop the free-function branch in the `compute_prs` tool's `genotypes_path`
+path and the per-score `best_performance` fallback in the by-trait loop — call
+`PRSCatalog.compute_prs(..., genotypes_lf=..., attach_performance=True)` directly.
+(Surfaced 2026-06-22 while wiring the wrapper onto 0.4.8's `attach_performance` (F11).)
+
+The batch method `PRSCatalog.compute_prs_batch` already accepts **both** `genotypes_lf`
+(reuse a normalized Parquet instead of re-reading the VCF) **and** `attach_performance`.
+The single-score `PRSCatalog.compute_prs` has `attach_performance` but **no**
+`genotypes_lf`; the low-level free function `just_prs.prs.compute_prs` is the mirror image
+— it has `genotypes_lf` but **no** `attach_performance` (and no catalog handle to look one
+up). So there is **no one-call path that both reuses a normalized genotype frame and
+attaches best performance for a single score.**
+
+Consequence in the wrapper (just-prs-mcp): the `compute_prs` tool's `genotypes_path`
+branch must call the low-level free function, so `attach_performance=True` is silently a
+no-op there (the result comes back with `performance=None`). The by-trait
+`genotypes_path` loop uses the same free function per score (to keep per-score failure
+isolation), so `compute_prs_by_trait(genotypes_path=..., interpret=True)` falls back to a
+separate `best_performance` lookup per score (`_best_performance_summary`,
+`tools/compute.py`) instead of the embedded attach. The plain-VCF paths are unaffected —
+they already use `compute_prs` / `compute_prs_batch` with `attach_performance`.
+
+Library fix (cheap — mirrors `compute_prs_batch`): add
+`genotypes_lf: pl.LazyFrame | None = None` to `PRSCatalog.compute_prs`. It is a method
+with catalog access that already owns the `_attach_performance` helper, so it can forward
+`genotypes_lf` to the low-level compute and attach performance itself — the exact thing
+`compute_prs_batch` does today. Once it lands, the wrapper drops its free-function branch
+and the per-score `best_performance` fallback entirely. (Adding `attach_performance` to
+the free `just_prs.prs.compute_prs` instead is the wrong layer: that function has no
+catalog/perf frame to source the metadata from.)
+
+Wrapper note: until this lands, `compute_prs(..., genotypes_path=..., attach_performance=True)`
+ignores the flag, and the by-trait genotypes-reuse path attaches performance via a
+per-score lookup rather than the batch attach. Cross-references F11
+(`previous_issues.md`).

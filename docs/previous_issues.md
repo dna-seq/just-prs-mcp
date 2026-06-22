@@ -7,7 +7,15 @@ upstream **just-prs library** change are tracked separately in
 mitigation, that mitigation is recorded below and the entry cross-links the
 upstream tracker.
 
-Ordered by finding number. Date of last sweep: 2026-06-21.
+Ordered by finding number. Date of last sweep: 2026-06-22.
+
+**2026-06-22 — `just-prs` 0.4.8 upstream landing.** The scoring-foundations library
+fixes for **F9** (percentile reliability metadata), **F10**, **F11**, and **F12** were
+published in `just-prs` **0.4.8**, pinned in `pyproject.toml`, and verified against the
+installed wheel. They moved out of `just-prs-pending-fixes.md` into the entries below;
+each now records both the wrapper resolution and the confirmed upstream API. F9's
+coverage-*normalization* remainder stays open as **F15**; F20 (composite quality gate)
+remains partially resolved upstream.
 
 ---
 
@@ -71,28 +79,85 @@ TODOs since they require live data/network per the testing policy.
 effect size, plus trait-level counts and a summary). `compute_prs_by_trait`
 optionally rolls up percentile/quality/performance per score with `interpret=True`.
 
-## F9 — Low-coverage percentile no longer emits a bare `0`/`100` *(wrapper resolved; upstream tracked)*
+## F9 — Low-coverage percentile no longer emits a bare `0`/`100` *(wrapper now uses the library C_wt verdict; 0.4.8)*
 
-`percentile` accepts `match_rate` and returns `reliable=False` + a `caveat` when
-coverage is low (<90%) or the result is a bare extreme (0/100)
-(`_percentile_result`, `tools/compute.py`). Verified by
-`test_percentile_low_match_rate_is_unreliable`. Normalizing the raw score by
-coverage inside the library is upstream — `just-prs-pending-fixes.md` F9.
+**Upstream (landed in `just-prs` 0.4.8, verified 2026-06-22).** `PRSResult` now carries
+weight-mass coverage `C_wt` as `weight_mass_coverage` (plus `weight_mass_matched` /
+`weight_mass_total`), and `PRSCatalog.percentile_full(score, pgs_id,
+weight_mass_coverage=...)` returns a `PercentileResult` with `reliable: bool` + `caveat:
+str`, flipping to `reliable=False` below `MIN_RELIABLE_WEIGHT_MASS_COVERAGE` (0.20,
+`prs_catalog.py`) while keeping the percentile value. The legacy count-based
+`MIN_PERCENTILE_MATCH_RATE` gate is left in place; the C_wt verdict is purely additive.
 
-## F10 — `assess_quality` / `percentile` no longer contradict *(wrapper resolved; upstream tracked)*
+**Wrapper (0.4.8 adoption).** `_percentile_result` (`tools/compute.py`) now calls
+`percentile_full(weight_mass_coverage=...)` and surfaces the library's `reliable`/`caveat`
+verdict — the old `match_rate < 0.9` heuristic is **removed**. The `percentile` tool's
+`match_rate` parameter was replaced by `weight_mass_coverage` (C_wt), trait-report rows
+carry `weight_mass_coverage` and `_row_rank_key` ranks on it ahead of match_rate, and a
+thin guard still flags a bare 0/100 only when no coverage signal was supplied. Verified by
+`test_percentile_low_coverage_is_unreliable`. The remaining gap — coverage-*normalizing*
+the raw score before comparison — is still upstream as **F15** in
+`just-prs-pending-fixes.md`.
 
-The quality path (`_quality_assessment`) no longer treats percentile availability
-as authoritative when a percentile was supplied separately; `percentile` is the
-source of reliability/caveat messaging. The `interpret_prs_result` library change
-is upstream — `just-prs-pending-fixes.md` F10.
+## F10 — `assess_quality` / `percentile` no longer contradict *(wrapper now forwards method/reliability; 0.4.8)*
 
-## F11 — Best performance attached in trait reports *(wrapper resolved; upstream tracked)*
+**Upstream (landed in `just-prs` 0.4.8, verified 2026-06-22).**
+`interpret_prs_result(percentile, match_rate, auroc, percentile_method=None,
+reliable=True, caveat='')` gained the three backward-compatible parameters: the summary
+now describes the *actual* percentile derivation via a method→phrase map, appends the
+`caveat` when `reliable=False`, and uses a generic "no population percentile available"
+sentence instead of blaming missing allele frequencies.
 
-`compute_prs_by_trait(interpret=True)` fetches best-performance per score and
-feeds AUROC into the quality label so no manual round-trip is needed
-(`_best_performance_summary`, `_trait_score_row`). Embedding performance directly
-in `PRSResult` and preferring `null` over an empty `effect_size` are upstream —
-`just-prs-pending-fixes.md` F11.
+**Wrapper (0.4.8 adoption).** `_quality_assessment` (`tools/compute.py`) now forwards
+`percentile_method` / `reliable` / `caveat` straight into `interpret_prs_result`, and the
+**summary string-patching hack is removed** — the library's text is consistent with
+whichever method ran. The `assess_quality` tool gained the same optional parameters, and
+the trait-report path threads the `percentile_full` method/verdict through.
+
+## F11 — Best performance attached in trait reports *(wrapper now uses attach_performance; 0.4.8)*
+
+**Upstream (landed in `just-prs` 0.4.8, verified 2026-06-22).** `compute_prs` and
+`compute_prs_batch` gained an opt-in `attach_performance: bool = False`; when `True` the
+score's `best_performance()` row is composed onto `PRSResult.performance` as a
+`PerformanceInfo` (effect sizes, AUROC/C-index, evaluation ancestry, sample number) — no
+separate round-trip. `format_effect_size` / `format_classification` now return
+`str | None` (None == "no estimate", distinct from an empty value).
+
+**Wrapper (0.4.8 adoption).** `compute_prs_by_trait(interpret=True)` now passes
+`attach_performance=True` into `compute_prs_batch`, and `_trait_score_row` reads AUROC +
+effect size off `result.performance` via `_auroc_from_performance` /
+`_format_effect_size` — the **per-score `best_performance` round-trip is eliminated** in
+the common VCF path (`_best_performance_summary` is kept only as the fallback for the
+low-level `genotypes_path` branch, which can't attach — that residual gap is tracked
+upstream as **F23** in `just-prs-pending-fixes.md`). The `compute_prs` /
+`compute_prs_batch` tools also expose an opt-in `attach_performance` parameter, and the
+widened `str | None` formatters are coalesced to `""` at the display layer
+(`tools/catalog.py`, `tools/compute.py`). Verified by
+`test_compute_prs_by_trait_attaches_performance`.
+
+## F12 — Raw-score → z-score → absolute-risk chain closed *(upstream landed in 0.4.8)*
+
+This was a purely upstream gap: `absolute_risk` required a z-score, but `compute_prs`
+returned only a raw score and `percentile` threw away the `z = (score − mean)/std` it
+computed internally. The wrapper could only mitigate the *prior* side — `prevalence_info`
+surfaces the prevalence table and `absolute_risk_bundle` returns every method's estimate
+with the prior it used (extended mode); it could not produce a reliable z-score alone.
+
+**Upstream (landed in `just-prs` 0.4.8, verified 2026-06-22).** `PercentileResult`
+(`PRSCatalog.percentile_full(...)`) and `PRSResult` now expose the true `z_score`,
+`reference_mean`, and `reference_std` actually used (no more lossy percentile inversion
+that clamped to `z=0` at the 0/100 extremes), and
+`PRSCatalog.absolute_risk_from_score(pgs_id, score, ancestry=, sex=,
+weight_mass_coverage=)` chains raw score → true-z → `absolute_risk_bundle` in one call.
+Risk numbers at the distribution extremes are now correct.
+
+**Wrapper (0.4.8 adoption).** The `percentile` tool's `PercentileResult` now carries the
+true `z_score` / `reference_mean` / `reference_std` from `percentile_full`, so a caller
+can feed absolute risk without inverting the percentile. The extended `absolute_risk_bundle`
+tool gained a raw-`score` path (plus `ancestry` / `weight_mass_coverage`): supply a raw
+score instead of a z-score and it routes through `absolute_risk_from_score` (true-z chain).
+Verified by `test_absolute_risk_bundle_from_raw_score` /
+`test_absolute_risk_bundle_requires_score_or_z`.
 
 ## F13 — `pass_filters=["PASS"]` / RefCall hom-ref drop *(closed — tested & disproven)*
 
