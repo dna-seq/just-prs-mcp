@@ -98,7 +98,7 @@ class PercentileResult(BaseModel):
     method: str = Field(
         description="'reference_panel', 'theoretical', 'auroc_approx', or 'unavailable'."
     )
-    ancestry: str = Field(description="1000G superpopulation used (AFR/AMR/EAS/EUR/SAS).")
+    ancestry: str = Field(description="Requested 1000G superpopulation (AFR/AMR/EAS/EUR/SAS).")
     reliable: bool = Field(
         default=True,
         description="False when the percentile should be treated as caveated or unreliable.",
@@ -117,6 +117,14 @@ class PercentileResult(BaseModel):
     )
     reference_std: float | None = Field(
         default=None, description="Reference-distribution SD used, when known."
+    )
+    reference_panel_ancestry: str | None = Field(
+        default=None,
+        description="Superpopulation of the reference panel actually used (reference_panel "
+        "method only) — check it matches the sample's ancestry before trusting the percentile.",
+    )
+    reference_panel: str | None = Field(
+        default=None, description="Reference panel identifier used (reference_panel method only)."
     )
 
 
@@ -156,6 +164,11 @@ class TraitScoreRow(BaseModel):
     percentile_caveat: str | None = Field(
         default=None, description="Warning attached to the percentile estimate."
     )
+    reference_panel_ancestry: str | None = Field(
+        default=None,
+        description="Ancestry of the reference panel used for this score's percentile — flag "
+        "when it disagrees with the sample's ancestry (reference_panel method only).",
+    )
     quality_label: str | None = Field(default=None, description="Optional quality label.")
     quality_summary: str | None = Field(default=None, description="Optional quality summary.")
     effect_size: str | None = Field(
@@ -171,6 +184,16 @@ class TraitPRSReport(BaseModel):
     trait_id: str = Field(description="Trait ontology ID used for lookup.")
     label: str = Field(description="Trait label.")
     genome_build: str = Field(description="Effective genome build used for scoring.")
+    detected_genome_build: str | None = Field(
+        default=None,
+        description="Genome build detected from the VCF (contigs/##reference), or null if "
+        "undetectable (e.g. pre-normalized input).",
+    )
+    build_mismatch: bool = Field(
+        default=False,
+        description="True when the detected VCF build disagrees with the scoring build — "
+        "treat coverage/percentiles as unreliable until resolved.",
+    )
     n_requested: int = Field(description="Number of PGS IDs selected for scoring.")
     n_scored: int = Field(description="Number of scores computed successfully.")
     n_failed: int = Field(description="Number of scores that failed.")

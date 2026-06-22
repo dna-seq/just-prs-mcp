@@ -17,6 +17,16 @@ each now records both the wrapper resolution and the confirmed upstream API. F9'
 coverage-*normalization* remainder stays open as **F15**; F20 (composite quality gate)
 remains partially resolved upstream.
 
+**2026-06-22 — `just-prs` 0.4.9 (Batch 2) landing.** Genome-build detection (**F4**) and
+single-score `genotypes_lf` (**F23**) were published in **0.4.9**, pinned, verified, and
+adopted in the wrapper — both moved here. **F19** is only *partially* resolved (percentile
+reference-panel ancestry now surfaced; dev-ancestry / sample inference / coherence veto
+still deferred P3), so it stays in `just-prs-pending-fixes.md` with the resolved slice
+recorded there. This sweep also fixed a latent wrapper bug: `compute_prs_batch` returns a
+`PRSBatchResult`, not a bare `list[PRSResult]` (since the 0.4.8 batch change), so the
+batch tool and by-trait report now read `.results` / `.outcomes` instead of iterating the
+model directly.
+
 ---
 
 ## F1 — "Compute all PRS for a trait" tool + batch in the base surface *(resolved)*
@@ -44,12 +54,25 @@ deprecated alias. Docstrings now read "by ontology ID (EFO or MONDO)".
 `compute_prs_by_trait` takes `trait_id` with the same semantics. Verified by
 `test_trait_info_accepts_trait_id_and_efo_id`.
 
-## F4 — Effective genome build echoed back *(wrapper resolved; upstream tracked)*
+## F4 — Genome build echoed back *and* detected from the VCF *(wrapper resolved; upstream landed in 0.4.9)*
 
-`NormalizeResult` and `TraitPRSReport` now carry the effective `genome_build`
-assumed for scoring (`models.py`, `tools/compute.py`). Build *inference from VCF
-contigs* and embedding the build in just-prs's `PRSResult` are upstream —
-see `just-prs-pending-fixes.md` F4.
+`NormalizeResult` and `TraitPRSReport` carry the effective `genome_build` assumed for
+scoring (`models.py`, `tools/compute.py`).
+
+**Upstream (landed in `just-prs` 0.4.9, verified 2026-06-22).** `compute_prs` /
+`compute_prs_duckdb` now call `just_prs.vcf.detect_genome_build()` (contig-length +
+`##reference` voting) and surface `detected_genome_build` + `build_mismatch` on
+`PRSResult`, logging a warning on mismatch. Detection is guarded: it runs only on a real,
+VCF-suffixed, existing file, so a pre-normalized Parquet / array / empty path yields
+`detected_genome_build=None` + `build_mismatch=False` (never a false mismatch).
+
+**Wrapper (0.4.9 adoption).** `compute_prs` / `compute_prs_batch` return the just-prs
+`PRSResult` directly, so `detected_genome_build` / `build_mismatch` are surfaced
+automatically. `compute_prs_by_trait` now folds them up to the report:
+`TraitPRSReport.detected_genome_build` + `build_mismatch` (per-VCF, captured from the
+first scored result) and a `WARNING: VCF build detected as … but scored on …` line in the
+summary when they disagree (`tools/compute.py`). `None` detected build means "couldn't
+tell," not "match." Verified by `test_compute_prs_by_trait_attaches_performance`.
 
 ## F5 — Slim `search_traits` payloads *(resolved)*
 
@@ -190,3 +213,22 @@ than an exception; lands where asked).
 Minor, deferred (neither blocks anything): the file arrives as plain uncompressed
 `.vcf` (not `.vcf.gz`/BGZF), and the docstring's "several GB for a full WGS
 genome" overstates Anton's 0.48 GB — loosen the size hint.
+
+## F23 — Single-score `genotypes_lf` so normalized-Parquet reuse attaches performance in one call *(wrapper now uses it; 0.4.9)*
+
+**Upstream (landed in `just-prs` 0.4.9, verified 2026-06-22).** `PRSCatalog.compute_prs`
+gained `genotypes_lf` (mirroring `compute_prs_batch`): it forwards the pre-normalized
+frame to the low-level compute and runs `_attach_performance` itself, so a single score
+reuses a normalized Parquet **and** attaches best performance in one call. This closes the
+gap from the 0.4.8 round, where the batch method had both params but the single-score
+method had only `attach_performance`.
+
+**Wrapper (0.4.9 adoption).** The `compute_prs` tool's `genotypes_path` branch now calls
+`cat.compute_prs(..., genotypes_lf=pl.scan_parquet(...), attach_performance=...)` — the
+low-level free-function branch and its manual `score_info_row` trait lookup are **gone**.
+`compute_prs_by_trait` is unified onto a **single** `compute_prs_batch(genotypes_lf=...,
+attach_performance=interpret)` call for both the VCF and Parquet-reuse paths, so the
+per-score loop and the `_best_performance_summary` fallback are **removed entirely**
+(`_best_performance_summary` deleted). Per-score errors come from the batch's `outcomes`.
+Verified by `test_compute_prs_genotypes_path_attaches_performance` and
+`test_compute_prs_by_trait_attaches_performance`.

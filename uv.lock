@@ -891,7 +891,7 @@ wheels = [
 
 [[package]]
 name = "just-prs"
-version = "0.4.8"
+version = "0.4.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "duckdb" },
@@ -907,9 +907,9 @@ dependencies = [
     { name = "typer" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1d/5d/b548f3750b00a06c09b46f3bff60a9582e31e0f3cbfc15b7c37410b9040a/just_prs-0.4.8.tar.gz", hash = "sha256:9ca83ab51d938c12fb06359b450396edbd9bb2699f878f719f8fed0080c3779b", size = 149197, upload-time = "2026-06-22T12:35:07.041Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/89/05b33f73eb11ada07266d36cdda34d67959b30936cb442fef7e4f2269b7a/just_prs-0.4.9.tar.gz", hash = "sha256:19b66851106cca0c1d6281b05ea18afa3426c63b6350169a9c3fbf02d00ced93", size = 150012, upload-time = "2026-06-22T14:11:06.659Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/86/16e3937507b964d8e7dc3f12b8003a033fcacb3ecdb7ad555e26097900ba/just_prs-0.4.8-py3-none-any.whl", hash = "sha256:7c7a59c520d756f928f75933f083a4bf11fbfbd581485ebdf57eb16852de5fbf", size = 162721, upload-time = "2026-06-22T12:35:05.632Z" },
+    { url = "https://files.pythonhosted.org/packages/23/67/41be6de93133c499fa29968307e4e74a3cccc233d86f016d7731d52d3748/just_prs-0.4.9-py3-none-any.whl", hash = "sha256:a615b3bf4cb48acec7c31c55342ff811affc7b5e3ed881d184712352b7a6db22", size = 163544, upload-time = "2026-06-22T14:11:05.147Z" },
 ]
 
 [[package]]
@@ -945,7 +945,7 @@ dev = [
 requires-dist = [
     { name = "anyio", specifier = ">=4" },
     { name = "fastmcp", extras = ["tasks"], specifier = ">=3.4.2" },
-    { name = "just-prs", specifier = "==0.4.8" },
+    { name = "just-prs", specifier = "==0.4.9" },
     { name = "pgenlib", marker = "sys_platform != 'win32' and extra == 'reference'" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2" },

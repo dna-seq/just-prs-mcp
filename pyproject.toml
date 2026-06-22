@@ -17,7 +17,7 @@ dependencies = [
     "pydantic-settings>=2",
     "typer>=0.16",
     "anyio>=4",
-    "just-prs==0.4.8",
+    "just-prs==0.4.9",
 ]
 
 [project.optional-dependencies]

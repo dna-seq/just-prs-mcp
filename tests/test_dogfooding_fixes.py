@@ -58,6 +58,8 @@ class FakeCatalog:
             reference_std=1.0,
             reliable=reliable,
             caveat=caveat,
+            ancestry=ancestry.upper(),
+            panel=panel,
         )
 
 
@@ -134,6 +136,9 @@ async def test_percentile_low_coverage_is_unreliable(essentials_client, monkeypa
     assert "C_wt" in result.data.caveat
     assert result.data.z_score == -3.5
     assert result.data.reference_std == 1.0
+    # F19: the reference-panel ancestry actually used is surfaced.
+    assert result.data.reference_panel_ancestry == "EUR"
+    assert result.data.reference_panel == "1000g"
 
 
 class FakeReportRest:
@@ -158,24 +163,42 @@ class FakeReportRest:
         )
 
 
+def _batch_result(results):
+    """Wrap PRSResults in a PRSBatchResult, mirroring just-prs's batch return shape."""
+    from just_prs.models import PRSBatchResult
+
+    return PRSBatchResult(
+        results=results,
+        outcomes=[],
+        n_total=len(results),
+        n_ok=len(results),
+        n_failed=0,
+        failed_ids=[],
+    )
+
+
 class FakeBatchCatalog:
     """Catalog whose batch scoring returns deterministic, varied match rates."""
 
     _RATES = {"PGS000001": 0.95, "PGS000002": 0.40, "PGS000003": 0.70}
 
-    def compute_prs_batch(self, vcf_path, pgs_ids, genome_build, attach_performance=False):
+    def compute_prs_batch(
+        self, vcf_path, pgs_ids, genome_build, genotypes_lf=None, attach_performance=False
+    ):
         from just_prs.models import PRSResult
 
-        return [
-            PRSResult(
-                pgs_id=pgs_id,
-                score=1.0,
-                variants_matched=int(1000 * self._RATES[pgs_id]),
-                variants_total=1000,
-                match_rate=self._RATES[pgs_id],
-            )
-            for pgs_id in pgs_ids
-        ]
+        return _batch_result(
+            [
+                PRSResult(
+                    pgs_id=pgs_id,
+                    score=1.0,
+                    variants_matched=int(1000 * self._RATES[pgs_id]),
+                    variants_total=1000,
+                    match_rate=self._RATES[pgs_id],
+                )
+                for pgs_id in pgs_ids
+            ]
+        )
 
 
 async def test_compute_prs_by_trait_top_n_trims_and_ranks(essentials_client, monkeypatch, tmp_path):
@@ -206,7 +229,9 @@ class FakePerfCatalog:
     """Batch catalog that attaches PerformanceInfo when asked; no best_performance method,
     so any per-score round-trip fallback would raise (and surface as a regression)."""
 
-    def compute_prs_batch(self, vcf_path, pgs_ids, genome_build, attach_performance=False):
+    def compute_prs_batch(
+        self, vcf_path, pgs_ids, genome_build, genotypes_lf=None, attach_performance=False
+    ):
         from just_prs.models import EffectSizeInfo, PerformanceInfo, PRSResult
 
         out = []
@@ -231,9 +256,10 @@ class FakePerfCatalog:
                     match_rate=0.9,
                     weight_mass_coverage=0.85,
                     performance=perf,
+                    detected_genome_build="GRCh38",
                 )
             )
-        return out
+        return _batch_result(out)
 
     def percentile_full(
         self, prs_score, pgs_id, ancestry="EUR", mean=0.0, std=None, panel="1000g",
@@ -244,12 +270,14 @@ class FakePerfCatalog:
         return PercentileResult(
             percentile=82.0, method="reference_panel", z_score=0.9,
             reference_mean=0.0, reference_std=1.0, reliable=True, caveat="",
+            ancestry=ancestry.upper(), panel=panel,
         )
 
 
 async def test_compute_prs_by_trait_attaches_performance(essentials_client, monkeypatch, tmp_path):
     """F11: interpret=True reads the batch-attached performance (auroc + effect size) and
-    C_wt (F9/F20) without a per-score best_performance round-trip."""
+    C_wt (F9/F20) without a per-score best_performance round-trip; the report surfaces the
+    detected genome build (F4) and rows carry the reference-panel ancestry (F19)."""
     from just_prs_mcp import client as mcp_client
 
     monkeypatch.setattr(mcp_client, "make_rest_client", FakeReportRest)
@@ -262,12 +290,62 @@ async def test_compute_prs_by_trait_attaches_performance(essentials_client, monk
         "compute_prs_by_trait",
         {"trait_id": "MONDO_0005148", "vcf_path": str(vcf), "interpret": True},
     )
-    rows = result.data.rows
+    report = result.data
+    rows = report.rows
 
     assert rows and all(r.auroc_estimate == 0.78 for r in rows)
     assert all(r.effect_size == "OR=1.55 [1.50-1.60]" for r in rows)
     assert all(r.weight_mass_coverage == 0.85 for r in rows)
     assert all(r.percentile == 82.0 and r.percentile_reliable for r in rows)
+    # F19: reference-panel ancestry surfaced per row.
+    assert all(r.reference_panel_ancestry == "EUR" for r in rows)
+    # F4: detected build surfaced on the report, no mismatch when it matches the scoring build.
+    assert report.detected_genome_build == "GRCh38"
+    assert report.build_mismatch is False
+
+
+async def test_compute_prs_genotypes_path_attaches_performance(
+    essentials_client, monkeypatch, tmp_path
+):
+    """F23: the single-score genotypes_path branch now routes through PRSCatalog.compute_prs
+    (genotypes_lf + attach_performance) — no low-level free function."""
+    from just_prs_mcp import client as mcp_client
+
+    captured: dict = {}
+
+    class FakeSingleCatalog:
+        def compute_prs(
+            self, vcf_path, pgs_id, genome_build="GRCh38", attach_performance=False,
+            genotypes_lf=None,
+        ):
+            from just_prs.models import PRSResult
+
+            captured["genotypes_lf_is_set"] = genotypes_lf is not None
+            captured["attach_performance"] = attach_performance
+            return PRSResult(
+                pgs_id=pgs_id, score=2.0, variants_matched=800, variants_total=1000,
+                match_rate=0.8, weight_mass_coverage=0.7,
+            )
+
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeSingleCatalog())
+
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text("##fileformat=VCFv4.2\n")
+    parquet = tmp_path / "geno.parquet"
+    parquet.write_bytes(b"PAR1")  # only needs to exist; scan is never executed by the fake
+
+    result = await essentials_client.call_tool(
+        "compute_prs",
+        {
+            "vcf_path": str(vcf),
+            "pgs_id": "PGS000014",
+            "genotypes_path": str(parquet),
+            "attach_performance": True,
+        },
+    )
+
+    assert result.data.pgs_id == "PGS000014"
+    assert captured == {"genotypes_lf_is_set": True, "attach_performance": True}
 
 
 class FakeRiskFromScoreCatalog:

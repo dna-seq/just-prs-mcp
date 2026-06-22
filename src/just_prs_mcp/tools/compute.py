@@ -26,7 +26,6 @@ from just_prs_mcp.models import (
     NormalizeResult,
     OpResult,
     PercentileResult,
-    PerformanceSummary,
     PRSResult,
     QualityAssessment,
     TraitPRSReport,
@@ -111,6 +110,8 @@ def _percentile_result(
         z_score=res.z_score,
         reference_mean=res.reference_mean,
         reference_std=res.reference_std,
+        reference_panel_ancestry=res.ancestry,
+        reference_panel=res.panel,
     )
 
 
@@ -133,29 +134,6 @@ def _format_effect_size(performance) -> str | None:
     if e.ci_lower is not None and e.ci_upper is not None:
         text += f" [{e.ci_lower:.2f}-{e.ci_upper:.2f}]"
     return text
-
-
-def _best_performance_summary(settings: Settings, pgs_id: str) -> PerformanceSummary:
-    from just_prs.quality import format_classification, format_effect_size
-
-    df = client.make_catalog(settings).best_performance(pgs_id=pgs_id).collect()
-    if df.height == 0:
-        return PerformanceSummary(pgs_id=pgs_id, found=False)
-    row = df.row(0, named=True)
-    effect_size = format_effect_size(row) or None
-    return PerformanceSummary(
-        pgs_id=pgs_id,
-        found=True,
-        n_individuals=row.get("n_individuals"),
-        ancestry_broad=row.get("ancestry_broad"),
-        or_estimate=row.get("or_estimate"),
-        hr_estimate=row.get("hr_estimate"),
-        beta_estimate=row.get("beta_estimate"),
-        auroc_estimate=row.get("auroc_estimate"),
-        cindex_estimate=row.get("cindex_estimate"),
-        effect_size=effect_size or "",
-        classification=format_classification(row) or "",
-    )
 
 
 def _trait_score_row(
@@ -182,16 +160,12 @@ def _trait_score_row(
         except Exception:  # noqa: BLE001 - interpretation is best-effort in aggregate reports
             percentile_result = None
         try:
-            # Prefer the performance the batch attached (attach_performance=True) — no
-            # per-score round-trip. Fall back to a lookup only for the low-level
-            # genotypes_path branch, which can't attach it.
+            # Performance is embedded by the batch (attach_performance=True) on both the
+            # VCF and genotypes-reuse paths now that compute_prs_batch takes genotypes_lf
+            # (F23) — no per-score best_performance round-trip.
             if result.performance is not None:
                 auroc = _auroc_from_performance(result.performance)
                 effect_size = _format_effect_size(result.performance)
-            else:
-                summary = _best_performance_summary(settings, result.pgs_id)
-                auroc = summary.auroc_estimate
-                effect_size = summary.effect_size or None
         except Exception:  # noqa: BLE001 - interpretation is best-effort in aggregate reports
             auroc, effect_size = None, None
         quality = _quality_assessment(
@@ -219,6 +193,9 @@ def _trait_score_row(
         ),
         percentile_reliable=percentile_result.reliable if percentile_result else None,
         percentile_caveat=percentile_result.caveat if percentile_result else None,
+        reference_panel_ancestry=(
+            percentile_result.reference_panel_ancestry if percentile_result else None
+        ),
         quality_label=quality.quality_label if quality else None,
         quality_summary=quality.summary if quality else None,
         effect_size=effect_size,
@@ -493,37 +470,27 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
 
         Set ``attach_performance=True`` to embed the score's best published
         performance (effect sizes, AUROC/C-index, evaluation ancestry) on the
-        result in the same call — no separate ``best_performance`` round-trip.
-        (Not honored on the ``genotypes_path`` reuse branch: ``PRSCatalog.compute_prs``
-        has no ``genotypes_lf`` yet — upstream gap, see
-        ``docs/just-prs-pending-fixes.md`` F23.)
+        result in the same call — no separate ``best_performance`` round-trip; it
+        is honored on the ``genotypes_path`` reuse branch too (F23). The result also
+        carries ``detected_genome_build`` / ``build_mismatch`` from the VCF (F4).
         """
         b = client.build(settings, genome_build)
         cat = client.make_catalog(settings)
         try:
+            genotypes_lf = None
             if genotypes_path:
                 import polars as pl
-                from just_prs.prs import compute_prs as _compute_prs
 
                 gpath = _require_file(genotypes_path, "Genotypes Parquet")
-                info = cat.score_info_row(pgs_id)
-                raw_trait = info.get("trait_reported") if info else None
-                trait = str(raw_trait) if raw_trait is not None else None
-                return _compute_prs(
-                    vcf_path=vcf_path,
-                    scoring_file=pgs_id,
-                    genome_build=b,
-                    cache_dir=client.resolved_cache_dir(settings) / "scores",
-                    pgs_id=pgs_id,
-                    trait_reported=trait,
-                    genotypes_lf=pl.scan_parquet(gpath),
-                )
-            _require_file(vcf_path, "VCF")
+                genotypes_lf = pl.scan_parquet(gpath)
+            else:
+                _require_file(vcf_path, "VCF")
             return cat.compute_prs(
                 vcf_path=vcf_path,
                 pgs_id=pgs_id,
                 genome_build=b,
                 attach_performance=attach_performance,
+                genotypes_lf=genotypes_lf,
             )
         except ToolError:
             raise
@@ -553,7 +520,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         _require_file(vcf_path, "VCF")
 
         await ctx.info(f"Batch-scoring {len(pgs_ids)} PGS IDs against {Path(vcf_path).name}")
-        results = await run_sync(
+        batch = await run_sync(
             lambda: cat.compute_prs_batch(
                 vcf_path=vcf_path,
                 pgs_ids=pgs_ids,
@@ -561,8 +528,10 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                 attach_performance=attach_performance,
             )
         )
-        await ctx.info(f"Computed {len(results)} score(s)")
-        return results
+        # compute_prs_batch returns a PRSBatchResult (results + per-score outcomes);
+        # the tool's contract is the list of successful PRSResults.
+        await ctx.info(f"Computed {batch.n_ok}/{batch.n_total} score(s); {batch.n_failed} failed")
+        return batch.results
 
     @mcp.tool(
         task=True,
@@ -614,82 +583,65 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         )
         await ctx.report_progress(progress=0, total=max(1, len(selected_ids)))
 
-        rows: list[TraitScoreRow] = []
+        # Single batch path for both VCF and normalized-Parquet reuse: compute_prs_batch
+        # accepts genotypes_lf and attach_performance (F23), so the per-score genotypes
+        # loop + best_performance round-trip are gone. The batch continues past per-score
+        # errors and reports them in `outcomes`.
+        genotypes_lf = None
         if genotypes_path:
             import polars as pl
-            from just_prs.prs import compute_prs as _compute_prs
 
             gpath = _require_file(genotypes_path, "Genotypes Parquet")
             genotypes_lf = pl.scan_parquet(gpath)
-            cat = client.make_catalog(settings)
-            for idx, pgs_id in enumerate(selected_ids, start=1):
-                try:
-                    info = cat.score_info_row(pgs_id)
-                    raw_trait = info.get("trait_reported") if info else None
-                    result = await run_sync(
-                        lambda pgs_id=pgs_id, raw_trait=raw_trait: _compute_prs(
-                            vcf_path=vcf_path,
-                            scoring_file=pgs_id,
-                            genome_build=b,
-                            cache_dir=client.resolved_cache_dir(settings) / "scores",
-                            pgs_id=pgs_id,
-                            trait_reported=str(raw_trait) if raw_trait is not None else None,
-                            genotypes_lf=genotypes_lf,
-                        )
-                    )
-                    rows.append(
-                        _trait_score_row(
-                            settings=settings,
-                            result=result,
-                            interpret=interpret,
-                            superpopulation=superpopulation,
-                            panel=panel,
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    rows.append(TraitScoreRow(pgs_id=pgs_id, status="failed", error=str(exc)))
-                await ctx.report_progress(progress=idx, total=max(1, len(selected_ids)))
         else:
             _require_file(vcf_path, "VCF")
-            try:
-                results = await run_sync(
-                    lambda: client.make_catalog(settings).compute_prs_batch(
-                        vcf_path=vcf_path,
-                        pgs_ids=selected_ids,
-                        genome_build=b,
-                        attach_performance=interpret,
+
+        rows: list[TraitScoreRow] = []
+        detected_genome_build: str | None = None
+        build_mismatch = False
+        try:
+            batch = await run_sync(
+                lambda: client.make_catalog(settings).compute_prs_batch(
+                    vcf_path=vcf_path,
+                    pgs_ids=selected_ids,
+                    genome_build=b,
+                    genotypes_lf=genotypes_lf,
+                    attach_performance=interpret,
+                )
+            )
+            by_id = {result.pgs_id: result for result in batch.results}
+            errors = {o.pgs_id: o.error for o in batch.outcomes if o.status != "ok"}
+            for pgs_id in selected_ids:
+                result = by_id.get(pgs_id)
+                if result is None:
+                    rows.append(
+                        TraitScoreRow(
+                            pgs_id=pgs_id,
+                            status="failed",
+                            error=errors.get(pgs_id) or "No result returned by batch scoring.",
+                        )
+                    )
+                    continue
+                # Build detection (F4) is per-VCF, so the same verdict applies to every
+                # score — capture the first non-null reading for the report header.
+                if detected_genome_build is None and result.detected_genome_build:
+                    detected_genome_build = result.detected_genome_build
+                build_mismatch = build_mismatch or bool(result.build_mismatch)
+                rows.append(
+                    _trait_score_row(
+                        settings=settings,
+                        result=result,
+                        interpret=interpret,
+                        superpopulation=superpopulation,
+                        panel=panel,
                     )
                 )
-                by_id = {result.pgs_id: result for result in results}
-                for pgs_id in selected_ids:
-                    result = by_id.get(pgs_id)
-                    if result is None:
-                        rows.append(
-                            TraitScoreRow(
-                                pgs_id=pgs_id,
-                                status="failed",
-                                error="No result returned by batch scoring.",
-                            )
-                        )
-                    else:
-                        rows.append(
-                            _trait_score_row(
-                                settings=settings,
-                                result=result,
-                                interpret=interpret,
-                                superpopulation=superpopulation,
-                                panel=panel,
-                            )
-                        )
-                await ctx.report_progress(
-                    progress=len(selected_ids),
-                    total=max(1, len(selected_ids)),
-                )
-            except Exception as exc:  # noqa: BLE001
-                rows = [
-                    TraitScoreRow(pgs_id=pgs_id, status="failed", error=str(exc))
-                    for pgs_id in selected_ids
-                ]
+            await ctx.report_progress(progress=len(selected_ids), total=max(1, len(selected_ids)))
+        except Exception as exc:  # noqa: BLE001
+            rows = [
+                TraitScoreRow(pgs_id=pgs_id, status="failed", error=str(exc))
+                for pgs_id in selected_ids
+            ]
 
         n_scored = sum(1 for row in rows if row.status == "scored")
         n_failed = sum(1 for row in rows if row.status == "failed")
@@ -709,10 +661,17 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             summary += f"; mean coverage {mean_match_rate:.0%}, {n_reliable} reliable percentile(s)"
         if n_omitted:
             summary += f"; {n_omitted} row(s) trimmed from response by top_n={top_n}"
+        if build_mismatch:
+            summary += (
+                f"; WARNING: VCF build detected as {detected_genome_build} but scored on {b} "
+                "— coverage/percentiles are unreliable until resolved"
+            )
         return TraitPRSReport(
             trait_id=trait.id,
             label=trait.label or trait.id,
             genome_build=b,
+            detected_genome_build=detected_genome_build,
+            build_mismatch=build_mismatch,
             n_requested=len(selected_ids),
             n_scored=n_scored,
             n_failed=n_failed,
