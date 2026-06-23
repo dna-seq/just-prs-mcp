@@ -214,6 +214,99 @@ def _trait_score_row(
     )
 
 
+def _scan_genome_catalog(settings: Settings) -> GenomeCatalog:
+    """Scan the cache dir for downloaded/normalized genomes (no network).
+
+    Shared by the ``list_genomes`` tool and the ``resource://prs/genomes``
+    resource so the inventory is computed exactly once, one way.
+    """
+    root = client.resolved_cache_dir(settings)
+    samples_dir = root / "samples"
+    normalized_dir = root / "normalized"
+
+    known_vcf_filenames = {
+        v["vcf_filename"]: k for k, v in _SAMPLE_GENOMES.items() if "vcf_filename" in v
+    }
+
+    downloaded: list[GenomeEntry] = []
+    if samples_dir.is_dir():
+        for f in sorted(samples_dir.iterdir()):
+            if f.is_file() and f.name.lower().endswith(_VCF_SUFFIXES):
+                downloaded.append(
+                    GenomeEntry(
+                        filename=f.name,
+                        path=str(f),
+                        size_bytes=f.stat().st_size,
+                        stage="downloaded",
+                        sample_alias=known_vcf_filenames.get(f.name),
+                    )
+                )
+
+    normalized: list[GenomeEntry] = []
+    if normalized_dir.is_dir():
+        for f in sorted(normalized_dir.iterdir()):
+            if f.is_file() and f.suffix == ".parquet":
+                stem = f.stem
+                alias = next(
+                    (
+                        k
+                        for k, v in _SAMPLE_GENOMES.items()
+                        if "vcf_filename" in v and v["vcf_filename"].split(".")[0] == stem
+                    ),
+                    None,
+                )
+                normalized.append(
+                    GenomeEntry(
+                        filename=f.name,
+                        path=str(f),
+                        size_bytes=f.stat().st_size,
+                        stage="normalized",
+                        sample_alias=alias,
+                    )
+                )
+
+    available_samples = [
+        {
+            "name": k,
+            "who": v["who"],
+            "license": v["license"],
+            "size_approx": v.get("size_approx", "unknown"),
+            "description": v.get("description", ""),
+            "zenodo_record": v["record"],
+            "already_downloaded": any(e.sample_alias == k for e in downloaded),
+            "already_normalized": any(e.sample_alias == k for e in normalized),
+        }
+        for k, v in _SAMPLE_GENOMES.items()
+    ]
+
+    parts = []
+    n_dl, n_nr = len(downloaded), len(normalized)
+    parts.append(f"{n_dl} downloaded VCF(s), {n_nr} normalized Parquet(s)")
+    not_downloaded = [s["name"] for s in available_samples if not s["already_downloaded"]]
+    if not_downloaded:
+        parts.append(
+            f"Available for download: {', '.join(not_downloaded)} (use download_sample_genome)"
+        )
+    not_normalized = [
+        e.filename
+        for e in downloaded
+        if not any(
+            n.sample_alias == e.sample_alias or n.filename.startswith(e.filename.split(".")[0])
+            for n in normalized
+        )
+    ]
+    if not_normalized:
+        parts.append(f"Not yet normalized: {', '.join(not_normalized)} (use normalize_vcf)")
+
+    return GenomeCatalog(
+        cache_dir=str(root),
+        downloaded=downloaded,
+        normalized=normalized,
+        available_samples=available_samples,
+        message=". ".join(parts) + ".",
+    )
+
+
 def _zenodo_api_url(sample: str | None, record_url: str | None) -> tuple[str, str]:
     """Resolve a sample alias or Zenodo record URL/ID to its API URL + a label.
 
@@ -376,6 +469,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         record_url: str | None = None,
         filename: str | None = None,
         auto_normalize: bool = False,
+        force: bool = False,
     ) -> OpResult:
         """Download a public sample WGS VCF from Zenodo to try PRS without your own data.
 
@@ -402,6 +496,14 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
 
         Use ``list_genomes`` to see which genomes have already been downloaded
         and/or normalized.
+
+        Idempotent: if the target VCF already exists with the size Zenodo
+        reports, the ~hundreds-of-MB download is skipped and the cached file is
+        reused; likewise a present Parquet skips re-normalization. ``data`` echoes
+        ``reused_cache`` (download skipped) and ``downloaded_bytes`` (bytes
+        actually transferred, 0 on a cache hit) so the caller can tell a cache
+        hit from a fresh fetch. Pass ``force=True`` to re-download/re-normalize
+        regardless.
 
         Returns an ``OpResult`` whose ``data`` carries the local ``path`` on
         success. Runs as a background task (files are hundreds of MB).
@@ -446,32 +548,55 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
 
                 dest = out_dir / str(chosen["key"])
                 total = int(chosen.get("size") or 0)
-                await ctx.info(
-                    f"Downloading {chosen['key']} ({total / 1e9:.2f} GB) from {label} -> {dest}"
-                )
-                await ctx.report_progress(progress=0, total=max(1, total))
                 downloaded = 0
-                with dest.open("wb") as fh:
-                    async with http.stream("GET", download_url) as resp:
-                        resp.raise_for_status()
-                        total = int(resp.headers.get("content-length") or total) or total
-                        async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
-                            fh.write(chunk)
-                            downloaded += len(chunk)
-                            if total:
-                                await ctx.report_progress(progress=downloaded, total=total)
+                reused_cache = False
+                if dest.exists() and not force and (total == 0 or dest.stat().st_size == total):
+                    # Idempotent cache hit — don't re-pull hundreds of MB. list_genomes
+                    # already treats this same file as already_downloaded.
+                    reused_cache = True
+                    await ctx.info(
+                        f"{chosen['key']} already cached at {dest} "
+                        f"({dest.stat().st_size / 1e9:.2f} GB) — reusing, skipping download."
+                    )
+                else:
+                    await ctx.info(
+                        f"Downloading {chosen['key']} ({total / 1e9:.2f} GB) from {label} -> {dest}"
+                    )
+                    await ctx.report_progress(progress=0, total=max(1, total))
+                    # Write to a temp file + atomic rename so concurrent fetchers of the
+                    # same sample don't read or race on a half-written VCF.
+                    tmp = dest.with_name(dest.name + ".part")
+                    with tmp.open("wb") as fh:
+                        async with http.stream("GET", download_url) as resp:
+                            resp.raise_for_status()
+                            total = int(resp.headers.get("content-length") or total) or total
+                            async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
+                                fh.write(chunk)
+                                downloaded += len(chunk)
+                                if total:
+                                    await ctx.report_progress(progress=downloaded, total=total)
+                    tmp.replace(dest)
         except Exception as exc:  # noqa: BLE001 — download outcome is data, not a protocol error
             return OpResult(success=False, message=f"Sample download failed: {exc}")
 
-        log.info("Downloaded sample genome %s (%d bytes) -> %s", chosen["key"], downloaded, dest)
+        file_bytes = dest.stat().st_size
+        if reused_cache:
+            log.info("Reused cached genome %s (%d bytes) at %s", chosen["key"], file_bytes, dest)
+        else:
+            log.info(
+                "Downloaded sample genome %s (%d bytes) -> %s", chosen["key"], downloaded, dest
+            )
 
         data: dict = {
             "path": str(dest),
             "filename": str(chosen["key"]),
-            "bytes": downloaded,
+            "bytes": file_bytes,
+            "downloaded_bytes": downloaded,
+            "reused_cache": reused_cache,
             "source": label,
         }
-        msg = f"Downloaded {chosen['key']} ({downloaded / 1e9:.2f} GB) from {label}."
+        verb = "Reused cached" if reused_cache else "Downloaded"
+        msg = f"{verb} {chosen['key']} ({file_bytes / 1e9:.2f} GB) from {label}."
 
         if auto_normalize:
             try:
@@ -480,13 +605,21 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                 norm_dir = client.resolved_cache_dir(settings) / "normalized"
                 norm_dir.mkdir(parents=True, exist_ok=True)
                 norm_out = norm_dir / (dest.name.split(".")[0] + ".parquet")
-                await ctx.info(f"Auto-normalizing {dest.name} -> {norm_out.name}")
-                norm_path = await run_sync(lambda: _normalize_vcf(dest, norm_out))
-                n = await run_sync(lambda: _count_rows(norm_path))
+                if norm_out.exists() and not force:
+                    norm_path = norm_out
+                    n = await run_sync(lambda: _count_rows(norm_path))
+                    data["normalized_reused"] = True
+                    msg += f" Reused cached Parquet {norm_path} ({n} variants)."
+                    log.info("Reused cached Parquet %s (%d variants)", norm_path, n)
+                else:
+                    await ctx.info(f"Auto-normalizing {dest.name} -> {norm_out.name}")
+                    norm_path = await run_sync(lambda: _normalize_vcf(dest, norm_out))
+                    n = await run_sync(lambda: _count_rows(norm_path))
+                    data["normalized_reused"] = False
+                    msg += f" Normalized to {norm_path} ({n} variants)."
+                    log.info("Auto-normalized %s (%d variants) -> %s", dest.name, n, norm_path)
                 data["normalized_path"] = str(norm_path)
                 data["n_variants"] = n
-                msg += f" Normalized to {norm_path} ({n} variants)."
-                log.info("Auto-normalized %s (%d variants) -> %s", dest.name, n, norm_path)
             except Exception as exc:  # noqa: BLE001
                 msg += f" Auto-normalization failed: {exc}. You can retry with normalize_vcf."
                 log.warning("Auto-normalization of %s failed: %s", dest.name, exc)
@@ -514,91 +647,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
 
         No network access required — reads the local filesystem only.
         """
-        root = client.resolved_cache_dir(settings)
-        samples_dir = root / "samples"
-        normalized_dir = root / "normalized"
-
-        known_vcf_filenames = {
-            v["vcf_filename"]: k for k, v in _SAMPLE_GENOMES.items() if "vcf_filename" in v
-        }
-
-        downloaded: list[GenomeEntry] = []
-        if samples_dir.is_dir():
-            for f in sorted(samples_dir.iterdir()):
-                if f.is_file() and f.name.lower().endswith(_VCF_SUFFIXES):
-                    downloaded.append(
-                        GenomeEntry(
-                            filename=f.name,
-                            path=str(f),
-                            size_bytes=f.stat().st_size,
-                            stage="downloaded",
-                            sample_alias=known_vcf_filenames.get(f.name),
-                        )
-                    )
-
-        normalized: list[GenomeEntry] = []
-        if normalized_dir.is_dir():
-            for f in sorted(normalized_dir.iterdir()):
-                if f.is_file() and f.suffix == ".parquet":
-                    stem = f.stem
-                    alias = next(
-                        (
-                            k
-                            for k, v in _SAMPLE_GENOMES.items()
-                            if "vcf_filename" in v and v["vcf_filename"].split(".")[0] == stem
-                        ),
-                        None,
-                    )
-                    normalized.append(
-                        GenomeEntry(
-                            filename=f.name,
-                            path=str(f),
-                            size_bytes=f.stat().st_size,
-                            stage="normalized",
-                            sample_alias=alias,
-                        )
-                    )
-
-        available_samples = [
-            {
-                "name": k,
-                "who": v["who"],
-                "license": v["license"],
-                "size_approx": v.get("size_approx", "unknown"),
-                "description": v.get("description", ""),
-                "zenodo_record": v["record"],
-                "already_downloaded": any(e.sample_alias == k for e in downloaded),
-                "already_normalized": any(e.sample_alias == k for e in normalized),
-            }
-            for k, v in _SAMPLE_GENOMES.items()
-        ]
-
-        parts = []
-        n_dl, n_nr = len(downloaded), len(normalized)
-        parts.append(f"{n_dl} downloaded VCF(s), {n_nr} normalized Parquet(s)")
-        not_downloaded = [s["name"] for s in available_samples if not s["already_downloaded"]]
-        if not_downloaded:
-            parts.append(
-                f"Available for download: {', '.join(not_downloaded)} (use download_sample_genome)"
-            )
-        not_normalized = [
-            e.filename
-            for e in downloaded
-            if not any(
-                n.sample_alias == e.sample_alias or n.filename.startswith(e.filename.split(".")[0])
-                for n in normalized
-            )
-        ]
-        if not_normalized:
-            parts.append(f"Not yet normalized: {', '.join(not_normalized)} (use normalize_vcf)")
-
-        return GenomeCatalog(
-            cache_dir=str(root),
-            downloaded=downloaded,
-            normalized=normalized,
-            available_samples=available_samples,
-            message=". ".join(parts) + ".",
-        )
+        return _scan_genome_catalog(settings)
 
     @mcp.tool(
         annotations=ToolAnnotations(title="Compute PRS", readOnlyHint=True, openWorldHint=True)
@@ -991,22 +1040,25 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             rankings: list[GenomeRanking] = []
             for tr in trait_reports:
                 reliable_rows = [
-                    row for row in tr.rows
-                    if row.status == "scored" and row.percentile is not None
+                    row
+                    for row in tr.rows
+                    if row.status == "scored"
+                    and row.percentile is not None
                     and row.percentile_reliable
                 ]
                 best_row = (
-                    max(reliable_rows, key=lambda r: r.match_rate or 0)
-                    if reliable_rows else None
+                    max(reliable_rows, key=lambda r: r.match_rate or 0) if reliable_rows else None
                 )
-                rankings.append(GenomeRanking(
-                    genome_label=tr.genome_label or "unknown",
-                    best_pgs_id=best_row.pgs_id if best_row else None,
-                    percentile=best_row.percentile if best_row else None,
-                    n_models_scored=tr.n_scored,
-                    n_reliable=tr.n_reliable,
-                    rank=0,
-                ))
+                rankings.append(
+                    GenomeRanking(
+                        genome_label=tr.genome_label or "unknown",
+                        best_pgs_id=best_row.pgs_id if best_row else None,
+                        percentile=best_row.percentile if best_row else None,
+                        n_models_scored=tr.n_scored,
+                        n_reliable=tr.n_reliable,
+                        rank=0,
+                    )
+                )
 
             # Sort high→low percentile, assign ranks.
             rankings.sort(
@@ -1028,9 +1080,12 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                     if tr.genome_label != top_label:
                         continue
                     alt_reliable = [
-                        row for row in tr.rows
-                        if row.status == "scored" and row.percentile is not None
-                        and row.percentile_reliable and row.pgs_id != rankings[0].best_pgs_id
+                        row
+                        for row in tr.rows
+                        if row.status == "scored"
+                        and row.percentile is not None
+                        and row.percentile_reliable
+                        and row.pgs_id != rankings[0].best_pgs_id
                     ]
                     second_genome = [g for g in rankings if g.genome_label != top_label]
                     if alt_reliable and second_genome:
@@ -1039,8 +1094,13 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                                 if sg_report.genome_label != second_genome[0].genome_label:
                                     continue
                                 sg_row = next(
-                                    (r for r in sg_report.rows if r.pgs_id == alt_row.pgs_id
-                                     and r.status == "scored" and r.percentile is not None),
+                                    (
+                                        r
+                                        for r in sg_report.rows
+                                        if r.pgs_id == alt_row.pgs_id
+                                        and r.status == "scored"
+                                        and r.percentile is not None
+                                    ),
                                     None,
                                 )
                                 if (
@@ -1052,13 +1112,15 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                                     consistency = "mixed"
                                     break
 
-            trait_comparisons.append(TraitComparison(
-                trait_id=trait_id,
-                label=label,
-                rankings=rankings,
-                percentile_spread=spread,
-                model_consistency=consistency,
-            ))
+            trait_comparisons.append(
+                TraitComparison(
+                    trait_id=trait_id,
+                    label=label,
+                    rankings=rankings,
+                    percentile_spread=spread,
+                    model_consistency=consistency,
+                )
+            )
 
         # Sort most divergent traits.
         divergent = sorted(
@@ -1067,13 +1129,10 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             reverse=True,
         )
 
-        all_labels = list(dict.fromkeys(
-            r.genome_label or "unknown" for r in reports
-        ))
+        all_labels = list(dict.fromkeys(r.genome_label or "unknown" for r in reports))
 
         summary_parts = [
-            f"Compared {len(all_labels)} genomes across "
-            f"{len(trait_comparisons)} trait(s)."
+            f"Compared {len(all_labels)} genomes across {len(trait_comparisons)} trait(s)."
         ]
         if divergent:
             summary_parts.append(
@@ -1103,6 +1162,20 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         for name in REFERENCE_PANELS:
             lines.append(f"- `{name}`")
         return "\n".join(lines)
+
+    @mcp.resource(
+        "resource://prs/genomes",
+        mime_type="application/json",
+    )
+    def genomes() -> str:
+        """Genomes cached on the server: downloaded VCFs and normalized Parquets.
+
+        Resource mirror of the ``list_genomes`` tool — the discovery surface a
+        client enumerates to find the server-side paths it may pass as
+        ``vcf_path`` / ``genotypes_path``, plus the pre-configured samples it can
+        fetch via ``download_sample_genome``. JSON, no network access.
+        """
+        return _scan_genome_catalog(settings).model_dump_json(indent=2)
 
     @mcp.prompt
     def compute_prs_for_trait(trait: str, vcf_path: str = "<path/to/sample.vcf.gz>") -> str:
@@ -1151,16 +1224,12 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
     @mcp.prompt
     def interpret_trait_results(trait: str, n_models: str = "", best_pgs_id: str = "") -> str:
         """Prompt template: interpret combined PRS results across multiple models for one trait."""
-        header = (
-            f"Interpret these combined Polygenic Risk Score (PRS) results for "
-            f"\"{trait}\".\n\n"
-        )
+        header = f'Interpret these combined Polygenic Risk Score (PRS) results for "{trait}".\n\n'
         if n_models:
             header += f"Models computed: {n_models}\n"
         if best_pgs_id:
             header += (
-                f"Best model: {best_pgs_id}  "
-                f"https://www.pgscatalog.org/score/{best_pgs_id}/\n"
+                f"Best model: {best_pgs_id}  https://www.pgscatalog.org/score/{best_pgs_id}/\n"
             )
         return (
             header + "\n"

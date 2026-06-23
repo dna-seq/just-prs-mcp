@@ -27,3 +27,34 @@ async def test_assess_quality_minimal_args(essentials_client):
 async def test_panels_resource(essentials_client):
     resources = {str(r.uri) for r in await essentials_client.list_resources()}
     assert "resource://prs/panels" in resources
+
+
+async def test_genomes_resource_listed(essentials_client):
+    resources = {str(r.uri) for r in await essentials_client.list_resources()}
+    assert "resource://prs/genomes" in resources
+
+
+async def test_genomes_resource_mirrors_list_genomes(tmp_path):
+    """The genomes resource returns the same inventory (JSON) as list_genomes."""
+    import json
+
+    from fastmcp.client import Client
+
+    from just_prs_mcp.server import build_server
+    from just_prs_mcp.settings import Settings
+
+    samples_dir = tmp_path / "samples"
+    samples_dir.mkdir()
+    (samples_dir / "antonkulaga.vcf").write_bytes(b"fake vcf content")
+
+    settings = Settings(cache_dir=str(tmp_path))
+    server = build_server(mode="essentials", settings=settings)
+    async with Client(transport=server) as client:
+        tool_cat = (await client.call_tool("list_genomes", {})).data
+        res = await client.read_resource("resource://prs/genomes")
+        payload = json.loads(res[0].text)
+
+    assert payload["cache_dir"] == str(tmp_path)
+    assert [e["path"] for e in payload["downloaded"]] == [e.path for e in tool_cat.downloaded]
+    assert payload["downloaded"][0]["filename"] == "antonkulaga.vcf"
+    assert payload["downloaded"][0]["sample_alias"] == "anton"

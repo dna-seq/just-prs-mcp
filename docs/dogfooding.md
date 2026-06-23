@@ -131,3 +131,50 @@ capability is effectively unreachable from a genuine result. **No reliable
 wrapper-only fix exists** — the library must expose the reference distribution
 parameters (or add `absolute_risk_from_score`). Tracked in
 `docs/just-prs-pending-fixes.md` F12.
+
+---
+
+## Batch 3 — remote-deployment dogfooding (2026-06-23)
+
+New pass driven against the **hosted** server (`just-prs-web`, cache dir
+`/home/web/.cache/just-prs`) instead of a local stdio server. Scenario: "compute
+a 5–35-model trait panel from a personal WGS VCF and plot it." The local-vs-remote
+filesystem split surfaces a cluster of gaps that don't appear when client and
+server share a disk. Trait used: **gout** (`MONDO_0005393`, 32 directly-associated
+scores); had to substitute Anton Kulaga's public WGS (`download_sample_genome
+sample="anton"`) because the user's own VCF could not reach the server (F24).
+
+## F24 — Remote server can't ingest a client-local VCF; no upload/fetch mechanism *(open / wrapper-actionable)*
+
+All computation tools take **server-side** filesystem paths (`vcf_path`,
+`genotypes_path`). Against a hosted server that's a different host/user than the
+client, so a path the client can see (`/data/newton/.../newton_winter.vcf`) just
+returns `VCF not found`. Today the **only** ways to get genotypes onto the server
+are `download_sample_genome` (Zenodo records only) or a file an admin pre-placed in
+the cache. A normal remote user with their own WGS has no path in.
+
+- Add a client→server ingest path: an upload tool / resumable-chunk upload, or a
+  "fetch this URL/presigned-S3/object-store key" tool that pulls to
+  `<cache_dir>/samples/`. `download_sample_genome`'s `record_url` is Zenodo-shaped;
+  generalize it (arbitrary HTTPS URL, with size/type guards) as a stopgap.
+- Until then, the server `instructions` should state plainly that compute tools
+  require server-side paths and that remote users must use `download_sample_genome`
+  / a fetch URL — otherwise the first call always fails confusingly.
+
+**F25** (`download_sample_genome` not idempotent — re-downloaded + re-normalized a
+cached sample) and **F26** (cached genomes not exposed as an MCP resource) are now
+**resolved in the wrapper** → `docs/previous_issues.md`. F25: cache-hit short-circuit
+(size match) + `force` param + `reused_cache`/`downloaded_bytes` in the result + atomic
+`.part` write; F26: `resource://prs/genomes` (JSON) backed by a shared
+`_scan_genome_catalog` helper.
+
+## F27 — No plotting / visualization tool exposed by MCP *(open / design question)*
+
+Producing the requested PNG graph of the trait panel has no server-side tool —
+the MCP surface is data-only (search/compute/interpret). Plotting therefore falls
+back to the client (matplotlib here). Worth deciding deliberately: either (a) keep
+viz client-side and document a canonical recipe / ship it in the
+`prs-trait-interpretation` skill, or (b) add a `plot_trait_panel` /
+`plot_prs_distribution` tool that returns a PNG (image content block) or an SVG
+resource. For a hosted server, server-side rendering is the only way non-coding
+clients get a chart at all.

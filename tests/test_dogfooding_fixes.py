@@ -427,6 +427,108 @@ async def test_download_sample_genome_unknown_sample_is_recoverable(essentials_c
     assert "Unknown sample" in result.data.message
 
 
+# --- F25: download_sample_genome is idempotent (no re-download when cached) ---
+
+_FAKE_VCF_BYTES = b"##fileformat=VCFv4.2\n" + b"x" * 200
+
+
+class _FakeStream:
+    """Async context manager mimicking httpx's streaming response."""
+
+    def __init__(self, counter: dict) -> None:
+        self._counter = counter
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    @property
+    def headers(self) -> dict:
+        return {"content-length": str(len(_FAKE_VCF_BYTES))}
+
+    async def aiter_bytes(self, chunk_size: int = 1 << 20):
+        self._counter["downloads"] += 1
+        yield _FAKE_VCF_BYTES
+
+
+class _FakeMetaResp:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return {
+            "files": [
+                {
+                    "key": "antonkulaga.vcf",
+                    "size": len(_FAKE_VCF_BYTES),
+                    "links": {"content": "https://example.test/antonkulaga.vcf"},
+                }
+            ]
+        }
+
+
+def _fake_async_client_factory(counter: dict):
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def get(self, url: str):
+            return _FakeMetaResp()
+
+        def stream(self, method: str, url: str):
+            return _FakeStream(counter)
+
+    return _FakeAsyncClient
+
+
+async def test_download_sample_genome_idempotent(tmp_path, monkeypatch):
+    """A second call reuses the cached VCF instead of re-streaming it (F25)."""
+    import httpx
+    from fastmcp.client import Client
+
+    from just_prs_mcp.server import build_server
+    from just_prs_mcp.settings import Settings
+
+    counter = {"downloads": 0}
+    monkeypatch.setattr(httpx, "AsyncClient", _fake_async_client_factory(counter))
+
+    settings = Settings(cache_dir=str(tmp_path))
+    server = build_server(mode="essentials", settings=settings)
+    async with Client(transport=server) as client:
+        first = (await client.call_tool("download_sample_genome", {"sample": "anton"})).data
+        assert first.success is True
+        assert first.data["reused_cache"] is False
+        assert first.data["downloaded_bytes"] == len(_FAKE_VCF_BYTES)
+        assert counter["downloads"] == 1
+
+        second = (await client.call_tool("download_sample_genome", {"sample": "anton"})).data
+        assert second.success is True
+        assert second.data["reused_cache"] is True
+        assert second.data["downloaded_bytes"] == 0
+        assert second.data["bytes"] == len(_FAKE_VCF_BYTES)
+        # No second stream — the big download was skipped.
+        assert counter["downloads"] == 1
+
+        forced = (
+            await client.call_tool(
+                "download_sample_genome", {"sample": "anton", "force": True}
+            )
+        ).data
+        assert forced.data["reused_cache"] is False
+        assert counter["downloads"] == 2
+
+
 class FakePrevalenceCatalog:
     """Catalog exposing a tiny in-memory prevalence table + score->EFO mapping."""
 

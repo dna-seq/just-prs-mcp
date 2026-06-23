@@ -232,3 +232,32 @@ per-score loop and the `_best_performance_summary` fallback are **removed entire
 (`_best_performance_summary` deleted). Per-score errors come from the batch's `outcomes`.
 Verified by `test_compute_prs_genotypes_path_attaches_performance` and
 `test_compute_prs_by_trait_attaches_performance`.
+
+## F25 — `download_sample_genome` is now idempotent *(resolved)*
+
+A second call for an already-cached sample no longer re-streams the ~hundreds-of-MB
+VCF (or re-normalizes). After the (cheap) Zenodo metadata fetch resolves the target
+filename and size, the tool checks `<cache_dir>/samples/<file>`: if it exists and the
+on-disk size matches Zenodo's reported size, the content download is skipped and the
+cached file reused; if `auto_normalize=True` and the Parquet already exists, normalization
+is skipped too. A new `force=False` param overrides both. `data` now echoes
+`reused_cache` (download skipped) and `downloaded_bytes` (0 on a cache hit) so a caller
+can tell a cache hit from a fresh fetch — the result message also flips to "Reused cached
+…". Downloads write to a `.part` temp file and atomically `Path.replace` into place so two
+clients fetching the same sample can't read a half-written VCF. `tools/compute.py`
+(`download_sample_genome`). Verified by `test_download_sample_genome_idempotent`.
+
+## F26 — Cached genomes exposed as an MCP resource *(resolved)*
+
+The server now serves `resource://prs/genomes` (JSON) alongside `resource://prs/panels`,
+so a client can enumerate the server-side paths it may pass as `vcf_path` /
+`genotypes_path` from the resource list rather than only via the `list_genomes` tool — the
+discovery surface the remote split (F24) makes essential. The scan that `list_genomes`
+performed was extracted into a shared `_scan_genome_catalog(settings)` helper; both the
+tool and the resource call it, so the inventory (downloaded VCFs, normalized Parquets, and
+the pre-configured downloadable samples, each with server paths/sizes/aliases) is computed
+exactly one way. `tools/compute.py` (`_scan_genome_catalog`, `genomes` resource,
+`list_genomes`). Verified by `test_genomes_resource_listed` and
+`test_genomes_resource_mirrors_list_genomes`. The per-genome templated URI
+(`resource://prs/genomes/{alias}`) noted as a "bonus" in the finding was not added — the
+single-resource inventory covers discovery.
