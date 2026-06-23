@@ -274,3 +274,17 @@ cached …" message. A new `force=False` re-normalizes unconditionally. Custom f
 Parquet may not reflect them and the wrapper keeps no record of what produced it.
 `tools/compute.py` (`normalize_vcf`); `NormalizeResult.reused_cache` added in `models.py`.
 Verified by `test_normalize_vcf_idempotent`.
+
+## F29 — `download_sample_genome` auto-normalizes by default *(resolved)*
+
+UX refinement off the F28 prod pass: a sample download used to return only a raw VCF
+(`auto_normalize=False`), forcing every caller through a second `normalize_vcf` round-trip
+before they could compute — wasted client/agent turns and tokens. The default is now
+`auto_normalize=True`, so a one-line `download_sample_genome(sample=...)` returns a
+compute-ready Parquet (`data["normalized_path"]`) in a single call; pass
+`auto_normalize=False` for the raw VCF only. Safe to make default because both steps are
+idempotent (F25/F28) — a re-download of an already-staged sample is cheap. This applies
+only to the sample-download path; a user's own **local** VCF still needs an explicit
+`normalize_vcf` call (no download step to fold it into). `tools/compute.py`
+(`download_sample_genome`); AGENTS.md Quick-Play updated. Verified by
+`test_download_sample_genome_auto_normalizes_by_default`.

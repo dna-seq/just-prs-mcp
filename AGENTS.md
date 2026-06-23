@@ -25,9 +25,10 @@ For testing, benchmarking, or demonstration purposes, two public whole-genome se
 ### Quick Play for Agents:
 If you are asked to demonstrate or test any PRS computation or VCF normalization, you can download and use these genomes automatically:
 1. Call `download_sample_genome(sample="anton")` or `download_sample_genome(sample="livia")`.
-2. The tool runs as a background task and returns the local file path on success.
-3. Pass that path to `normalize_vcf` to generate a normalized genotype Parquet file.
-4. Pass the normalized Parquet file to `compute_prs` or `compute_prs_batch` to compute Polygenic Risk Scores.
+2. The tool runs as a background task. It **auto-normalizes by default** (`auto_normalize=True`), so on success `data` carries both `path` (raw VCF) and `normalized_path` (compute-ready Parquet) — no separate `normalize_vcf` call needed. Pass `auto_normalize=False` for the raw VCF only.
+3. Pass `data["normalized_path"]` to `compute_prs` / `compute_prs_batch` (as `genotypes_path`) to compute Polygenic Risk Scores.
+
+Both the download and the normalization are idempotent (size-matched VCF / existing Parquet are reused; `reused_cache` / `normalized_reused` flag the hit). A user's own **local** VCF still needs an explicit `normalize_vcf` call — only the sample-download path folds it in.
 
 ## Commands (prefer these)
 

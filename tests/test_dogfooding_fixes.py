@@ -505,14 +505,17 @@ async def test_download_sample_genome_idempotent(tmp_path, monkeypatch):
 
     settings = Settings(cache_dir=str(tmp_path))
     server = build_server(mode="essentials", settings=settings)
+    # auto_normalize defaults to True; pin it off here to isolate download idempotency
+    # (the fake VCF bytes aren't a real VCF, so normalization isn't under test).
+    base = {"sample": "anton", "auto_normalize": False}
     async with Client(transport=server) as client:
-        first = (await client.call_tool("download_sample_genome", {"sample": "anton"})).data
+        first = (await client.call_tool("download_sample_genome", base)).data
         assert first.success is True
         assert first.data["reused_cache"] is False
         assert first.data["downloaded_bytes"] == len(_FAKE_VCF_BYTES)
         assert counter["downloads"] == 1
 
-        second = (await client.call_tool("download_sample_genome", {"sample": "anton"})).data
+        second = (await client.call_tool("download_sample_genome", base)).data
         assert second.success is True
         assert second.data["reused_cache"] is True
         assert second.data["downloaded_bytes"] == 0
@@ -521,10 +524,45 @@ async def test_download_sample_genome_idempotent(tmp_path, monkeypatch):
         assert counter["downloads"] == 1
 
         forced = (
-            await client.call_tool("download_sample_genome", {"sample": "anton", "force": True})
+            await client.call_tool(
+                "download_sample_genome",
+                {**base, "force": True},
+            )
         ).data
         assert forced.data["reused_cache"] is False
         assert counter["downloads"] == 2
+
+
+async def test_download_sample_genome_auto_normalizes_by_default(tmp_path, monkeypatch):
+    """A bare download normalizes in the same call (default auto_normalize=True)."""
+    import httpx
+    import just_prs.normalize as jn
+    from fastmcp.client import Client
+
+    from just_prs_mcp.server import build_server
+    from just_prs_mcp.settings import Settings
+    from just_prs_mcp.tools import compute as compute_mod
+
+    counter = {"downloads": 0}
+    monkeypatch.setattr(httpx, "AsyncClient", _fake_async_client_factory(counter))
+
+    def _fake_normalize(src, out, config=None):
+        from pathlib import Path
+
+        Path(out).write_bytes(b"normalized")
+        return Path(out)
+
+    monkeypatch.setattr(jn, "normalize_vcf", _fake_normalize)
+    monkeypatch.setattr(compute_mod, "_count_rows", lambda p: 7)
+
+    settings = Settings(cache_dir=str(tmp_path))
+    server = build_server(mode="essentials", settings=settings)
+    async with Client(transport=server) as client:
+        # No auto_normalize passed -> default True -> one-call compute-ready Parquet.
+        res = (await client.call_tool("download_sample_genome", {"sample": "anton"})).data
+        assert res.success is True
+        assert res.data["normalized_path"].endswith("antonkulaga.parquet")
+        assert res.data["n_variants"] == 7
 
 
 # --- F28: normalize_vcf is idempotent (reuses an existing Parquet) ---

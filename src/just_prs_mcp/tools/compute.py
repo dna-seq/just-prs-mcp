@@ -490,7 +490,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         output_dir: str | None = None,
         record_url: str | None = None,
         filename: str | None = None,
-        auto_normalize: bool = False,
+        auto_normalize: bool = True,
         force: bool = False,
     ) -> OpResult:
         """Download a public sample WGS VCF from Zenodo to try PRS without your own data.
@@ -510,11 +510,12 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         The downloaded VCF lands under ``<cache_dir>/samples/`` (or ``output_dir``)
         and is a drop-in path for ``normalize_vcf`` / ``compute_prs``.
 
-        Set ``auto_normalize=True`` to automatically run ``normalize_vcf`` on
-        the downloaded file, producing a reusable Parquet for faster batch
-        scoring. When enabled, ``data`` includes both ``path`` (the raw VCF)
-        and ``normalized_path`` (the Parquet). When disabled (default), call
-        ``normalize_vcf`` separately after download.
+        ``auto_normalize`` defaults to ``True``: the download is normalized to a
+        reusable Parquet in the same call, so ``data`` carries both ``path`` (the
+        raw VCF) and ``normalized_path`` — a one-call, compute-ready genotype
+        source with no separate ``normalize_vcf`` round-trip. (Normalization is
+        idempotent, so a re-download of an already-staged sample is cheap.) Pass
+        ``auto_normalize=False`` to fetch the raw VCF only.
 
         Use ``list_genomes`` to see which genomes have already been downloaded
         and/or normalized.
