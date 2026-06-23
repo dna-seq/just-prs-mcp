@@ -10,6 +10,7 @@ ESSENTIALS = {
     "trait_info",
     "normalize_vcf",
     "download_sample_genome",
+    "list_genomes",
     "compute_prs",
     "compute_prs_batch",
     "compute_prs_by_trait",

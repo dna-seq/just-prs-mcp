@@ -217,6 +217,16 @@ class TraitPRSReport(BaseModel):
         description="Per-score results (ranked best-coverage first; trimmed to ``top_n`` when set)."
     )
     summary: str = Field(description="Human-readable summary.")
+    genome_label: str | None = Field(
+        default=None,
+        description="Label identifying which genome was scored (e.g. 'anton', 'livia', or a "
+        "filename stem). Set automatically when the result is saved to disk.",
+    )
+    result_path: str | None = Field(
+        default=None,
+        description="Path where this result was auto-saved as JSON. Pass to ``compare_genomes`` "
+        "to build a cross-genome comparison without re-serializing the full report.",
+    )
 
 
 class PrevalenceRow(BaseModel):
@@ -253,6 +263,42 @@ class PrevalenceInfo(BaseModel):
     n_matches: int = Field(description="Number of matching prevalence rows.")
     rows: list[PrevalenceRow] = Field(
         default_factory=list, description="Matching prevalence prior rows."
+    )
+    message: str = Field(description="Human-readable summary.")
+
+
+class GenomeEntry(BaseModel):
+    """One genome file discovered in the cache directory."""
+
+    filename: str = Field(description="File name (e.g. 'antonkulaga.vcf').")
+    path: str = Field(description="Absolute path on the server filesystem.")
+    size_bytes: int = Field(description="File size in bytes.")
+    stage: str = Field(
+        description="'downloaded' (raw VCF in samples/) or 'normalized' (Parquet in normalized/)."
+    )
+    sample_alias: str | None = Field(
+        default=None,
+        description="Pre-configured sample alias ('anton', 'livia') if this file matches one, "
+        "else null.",
+    )
+
+
+class GenomeCatalog(BaseModel):
+    """Inventory of genomes present in the server's cache directory."""
+
+    cache_dir: str = Field(description="Root cache directory path.")
+    downloaded: list[GenomeEntry] = Field(
+        default_factory=list,
+        description="Raw VCF files in <cache_dir>/samples/.",
+    )
+    normalized: list[GenomeEntry] = Field(
+        default_factory=list,
+        description="Normalized Parquet files in <cache_dir>/normalized/.",
+    )
+    available_samples: list[dict] = Field(
+        default_factory=list,
+        description="Pre-configured sample genomes that can be downloaded via "
+        "download_sample_genome (name, description, size, license).",
     )
     message: str = Field(description="Human-readable summary.")
 
@@ -304,3 +350,57 @@ class BatchScoringSummary(BaseModel):
     distributions: list[DistributionRow] = Field(
         default_factory=list, description="Aggregated per-superpopulation distributions."
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-genome comparison models
+# ---------------------------------------------------------------------------
+
+
+class GenomeRanking(BaseModel):
+    """One genome's position in a per-trait ranking."""
+
+    genome_label: str = Field(description="Label identifying the genome (e.g. 'anton').")
+    best_pgs_id: str | None = Field(
+        default=None, description="PGS ID of the highest-coverage reliable model used."
+    )
+    percentile: float | None = Field(
+        default=None, description="Best-model percentile (0-100), or null if none reliable."
+    )
+    n_models_scored: int = Field(description="Total models scored for this genome × trait.")
+    n_reliable: int = Field(description="Models with reliable percentiles.")
+    rank: int = Field(
+        description="1-based rank among compared genomes, sorted HIGH percentile first. "
+        "No directionality judgment — the LLM decides whether high is good or bad for this trait."
+    )
+
+
+class TraitComparison(BaseModel):
+    """Cross-genome comparison for a single trait."""
+
+    trait_id: str = Field(description="Trait ontology ID.")
+    label: str = Field(description="Trait label.")
+    rankings: list[GenomeRanking] = Field(
+        description="Genomes ranked by best-model percentile, highest first."
+    )
+    percentile_spread: float | None = Field(
+        default=None,
+        description="Max minus min best-model percentile across genomes — magnitude of divergence.",
+    )
+    model_consistency: str = Field(
+        description="'consistent' if all genomes' reliable models agree on rank order, "
+        "'mixed' otherwise."
+    )
+
+
+class GenomeComparison(BaseModel):
+    """Structured comparison of PRS results across multiple genomes."""
+
+    genome_labels: list[str] = Field(description="Labels of the compared genomes, in input order.")
+    n_traits: int = Field(description="Number of traits compared.")
+    traits: list[TraitComparison] = Field(description="Per-trait comparison details.")
+    most_divergent_traits: list[str] = Field(
+        description="Trait labels sorted by percentile_spread descending — traits where the "
+        "genomes differ most, for the LLM to highlight."
+    )
+    summary: str = Field(description="Human-readable summary of the comparison.")

@@ -17,7 +17,7 @@ dependencies = [
     "pydantic-settings>=2",
     "typer>=0.16",
     "anyio>=4",
-    "just-prs==0.4.9",
+    "just-prs==0.4.12",
 ]
 
 [project.optional-dependencies]
@@ -46,12 +46,21 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
     "pyright>=1.1.380",
+    "agno>=2.6.11",
+    "openai>=2.41.0",
+    "google-genai>=2.8.0,<2.9.0",
+    "httpx>=0.27",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+markers = [
+    "integration: agentic tests that call an LLM API (require API key)",
+    "slow: tests that take minutes (genome download/normalization/scoring)",
+    "network: tests that require live network access (PGS Catalog, Zenodo)",
+]
 filterwarnings = [
     # Benign deprecation emitted inside opentelemetry (a transitive dep of
     # fastmcp + pydocket), not our code. Remove once upstream updates.

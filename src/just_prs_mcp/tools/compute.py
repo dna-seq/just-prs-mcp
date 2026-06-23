@@ -23,11 +23,16 @@ from just_prs_mcp import client
 from just_prs_mcp.logging_setup import get_logger
 from just_prs_mcp.models import (
     AbsoluteRisk,
+    GenomeCatalog,
+    GenomeComparison,
+    GenomeEntry,
+    GenomeRanking,
     NormalizeResult,
     OpResult,
     PercentileResult,
     PRSResult,
     QualityAssessment,
+    TraitComparison,
     TraitPRSReport,
     TraitScoreRow,
 )
@@ -42,11 +47,17 @@ _SAMPLE_GENOMES: dict[str, dict[str, str]] = {
         "record": "18370498",
         "who": "Anton Kulaga",
         "license": "CC0 (public domain)",
+        "vcf_filename": "antonkulaga.vcf",
+        "size_approx": "~482 MB",
+        "description": "Whole-genome sequencing (WGS), open-sourced by the just-dna-lite project.",
     },
     "livia": {
         "record": "19487816",
         "who": "Livia Zaharia",
         "license": "CC-BY-4.0",
+        "vcf_filename": "SIMHIFQTILQ.hard-filtered.vcf.gz",
+        "size_approx": "~349 MB",
+        "description": "WGS, hard-filtered, from the just-dna-lite project.",
     },
 }
 
@@ -364,19 +375,36 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         output_dir: str | None = None,
         record_url: str | None = None,
         filename: str | None = None,
+        auto_normalize: bool = False,
     ) -> OpResult:
         """Download a public sample WGS VCF from Zenodo to try PRS without your own data.
 
-        For users who don't have their own VCF: two genomes open-sourced by the
-        just-dna-lite authors are available — ``sample="anton"`` (Anton Kulaga,
-        CC0) and ``sample="livia"`` (Livia Zaharia, CC-BY-4.0). Pass ``record_url``
-        (e.g. 'https://zenodo.org/records/18370498') to fetch any other Zenodo
-        record, and ``filename`` to pick a specific file when a record has several.
+        Two whole-genome sequencing (WGS) datasets open-sourced by the
+        just-dna-lite project are pre-configured:
 
-        The downloaded ``.vcf`` / ``.vcf.gz`` lands under the cache dir (or
-        ``output_dir``) and is a drop-in path for ``normalize_vcf`` / ``compute_prs``.
-        Returns an ``OpResult`` whose ``data`` carries the local ``path`` on success.
-        Runs as a background task (the file is several GB for a full WGS genome).
+        - ``sample="anton"`` — Anton Kulaga's genome (~482 MB, CC0 public domain,
+          Zenodo record 18370498, file: antonkulaga.vcf).
+        - ``sample="livia"`` — Livia Zaharia's genome (~349 MB, CC-BY-4.0,
+          Zenodo record 19487816, file: SIMHIFQTILQ.hard-filtered.vcf.gz).
+
+        Pass ``record_url`` (e.g. 'https://zenodo.org/records/18370498') to fetch
+        any other Zenodo record, and ``filename`` to pick a specific file when a
+        record has several.
+
+        The downloaded VCF lands under ``<cache_dir>/samples/`` (or ``output_dir``)
+        and is a drop-in path for ``normalize_vcf`` / ``compute_prs``.
+
+        Set ``auto_normalize=True`` to automatically run ``normalize_vcf`` on
+        the downloaded file, producing a reusable Parquet for faster batch
+        scoring. When enabled, ``data`` includes both ``path`` (the raw VCF)
+        and ``normalized_path`` (the Parquet). When disabled (default), call
+        ``normalize_vcf`` separately after download.
+
+        Use ``list_genomes`` to see which genomes have already been downloaded
+        and/or normalized.
+
+        Returns an ``OpResult`` whose ``data`` carries the local ``path`` on
+        success. Runs as a background task (files are hundreds of MB).
         """
         import httpx
 
@@ -436,18 +464,140 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             return OpResult(success=False, message=f"Sample download failed: {exc}")
 
         log.info("Downloaded sample genome %s (%d bytes) -> %s", chosen["key"], downloaded, dest)
-        return OpResult(
-            success=True,
-            message=(
-                f"Downloaded {chosen['key']} ({downloaded / 1e9:.2f} GB) from {label}. "
-                f"Pass it to normalize_vcf or compute_prs as the VCF path."
-            ),
-            data={
-                "path": str(dest),
-                "filename": str(chosen["key"]),
-                "bytes": downloaded,
-                "source": label,
-            },
+
+        data: dict = {
+            "path": str(dest),
+            "filename": str(chosen["key"]),
+            "bytes": downloaded,
+            "source": label,
+        }
+        msg = f"Downloaded {chosen['key']} ({downloaded / 1e9:.2f} GB) from {label}."
+
+        if auto_normalize:
+            try:
+                from just_prs.normalize import normalize_vcf as _normalize_vcf
+
+                norm_dir = client.resolved_cache_dir(settings) / "normalized"
+                norm_dir.mkdir(parents=True, exist_ok=True)
+                norm_out = norm_dir / (dest.name.split(".")[0] + ".parquet")
+                await ctx.info(f"Auto-normalizing {dest.name} -> {norm_out.name}")
+                norm_path = await run_sync(lambda: _normalize_vcf(dest, norm_out))
+                n = await run_sync(lambda: _count_rows(norm_path))
+                data["normalized_path"] = str(norm_path)
+                data["n_variants"] = n
+                msg += f" Normalized to {norm_path} ({n} variants)."
+                log.info("Auto-normalized %s (%d variants) -> %s", dest.name, n, norm_path)
+            except Exception as exc:  # noqa: BLE001
+                msg += f" Auto-normalization failed: {exc}. You can retry with normalize_vcf."
+                log.warning("Auto-normalization of %s failed: %s", dest.name, exc)
+        else:
+            msg += " Pass it to normalize_vcf or compute_prs as the VCF path."
+
+        return OpResult(success=True, message=msg, data=data)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(title="List genomes", readOnlyHint=True),
+    )
+    def list_genomes() -> GenomeCatalog:
+        """List genomes available in the server's cache directory.
+
+        Scans ``<cache_dir>/samples/`` for downloaded raw VCF files and
+        ``<cache_dir>/normalized/`` for normalized Parquet files. Also lists
+        the pre-configured sample genomes that can be downloaded via
+        ``download_sample_genome`` (even if not yet downloaded).
+
+        Use this to discover:
+        - Which genomes have already been downloaded (ready for normalize_vcf).
+        - Which genomes have already been normalized (ready for compute_prs
+          as ``genotypes_path``).
+        - Which pre-configured samples are available for download.
+
+        No network access required — reads the local filesystem only.
+        """
+        root = client.resolved_cache_dir(settings)
+        samples_dir = root / "samples"
+        normalized_dir = root / "normalized"
+
+        known_vcf_filenames = {
+            v["vcf_filename"]: k for k, v in _SAMPLE_GENOMES.items() if "vcf_filename" in v
+        }
+
+        downloaded: list[GenomeEntry] = []
+        if samples_dir.is_dir():
+            for f in sorted(samples_dir.iterdir()):
+                if f.is_file() and f.name.lower().endswith(_VCF_SUFFIXES):
+                    downloaded.append(
+                        GenomeEntry(
+                            filename=f.name,
+                            path=str(f),
+                            size_bytes=f.stat().st_size,
+                            stage="downloaded",
+                            sample_alias=known_vcf_filenames.get(f.name),
+                        )
+                    )
+
+        normalized: list[GenomeEntry] = []
+        if normalized_dir.is_dir():
+            for f in sorted(normalized_dir.iterdir()):
+                if f.is_file() and f.suffix == ".parquet":
+                    stem = f.stem
+                    alias = next(
+                        (
+                            k
+                            for k, v in _SAMPLE_GENOMES.items()
+                            if "vcf_filename" in v and v["vcf_filename"].split(".")[0] == stem
+                        ),
+                        None,
+                    )
+                    normalized.append(
+                        GenomeEntry(
+                            filename=f.name,
+                            path=str(f),
+                            size_bytes=f.stat().st_size,
+                            stage="normalized",
+                            sample_alias=alias,
+                        )
+                    )
+
+        available_samples = [
+            {
+                "name": k,
+                "who": v["who"],
+                "license": v["license"],
+                "size_approx": v.get("size_approx", "unknown"),
+                "description": v.get("description", ""),
+                "zenodo_record": v["record"],
+                "already_downloaded": any(e.sample_alias == k for e in downloaded),
+                "already_normalized": any(e.sample_alias == k for e in normalized),
+            }
+            for k, v in _SAMPLE_GENOMES.items()
+        ]
+
+        parts = []
+        n_dl, n_nr = len(downloaded), len(normalized)
+        parts.append(f"{n_dl} downloaded VCF(s), {n_nr} normalized Parquet(s)")
+        not_downloaded = [s["name"] for s in available_samples if not s["already_downloaded"]]
+        if not_downloaded:
+            parts.append(
+                f"Available for download: {', '.join(not_downloaded)} (use download_sample_genome)"
+            )
+        not_normalized = [
+            e.filename
+            for e in downloaded
+            if not any(
+                n.sample_alias == e.sample_alias or n.filename.startswith(e.filename.split(".")[0])
+                for n in normalized
+            )
+        ]
+        if not_normalized:
+            parts.append(f"Not yet normalized: {', '.join(not_normalized)} (use normalize_vcf)")
+
+        return GenomeCatalog(
+            cache_dir=str(root),
+            downloaded=downloaded,
+            normalized=normalized,
+            available_samples=available_samples,
+            message=". ".join(parts) + ".",
         )
 
     @mcp.tool(
@@ -473,6 +623,11 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         result in the same call — no separate ``best_performance`` round-trip; it
         is honored on the ``genotypes_path`` reuse branch too (F23). The result also
         carries ``detected_genome_build`` / ``build_mismatch`` from the VCF (F4).
+
+        **Recommended follow-up:** after computing the score, call ``percentile``
+        to place it on the population distribution, then call ``absolute_risk``
+        with the z_score from the percentile result to get the concrete disease
+        probability and risk ratio (for disease traits with prevalence data).
         """
         b = client.build(settings, genome_build)
         cat = client.make_catalog(settings)
@@ -666,7 +821,9 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                 f"; WARNING: VCF build detected as {detected_genome_build} but scored on {b} "
                 "— coverage/percentiles are unreliable until resolved"
             )
-        return TraitPRSReport(
+        genome_label = Path(vcf_path).stem.split(".")[0]
+
+        report = TraitPRSReport(
             trait_id=trait.id,
             label=trait.label or trait.id,
             genome_build=b,
@@ -682,7 +839,18 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             n_omitted=n_omitted,
             rows=returned,
             summary=summary + ".",
+            genome_label=genome_label,
         )
+
+        # Auto-save to disk so compare_genomes can load by path.
+        results_dir = Path(client.resolved_cache_dir(settings)) / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        safe_trait = trait.id.replace(":", "_").replace("/", "_")
+        save_path = results_dir / f"{genome_label}_{safe_trait}.json"
+        save_path.write_text(report.model_dump_json(indent=2))
+        report.result_path = str(save_path)
+
+        return report
 
     @mcp.tool(
         annotations=ToolAnnotations(title="PRS percentile", readOnlyHint=True, openWorldHint=True)
@@ -704,6 +872,11 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         instead of presented as authoritative. Also returns the true z-score and
         reference mean/std used, so absolute risk can be computed without
         inverting the percentile.
+
+        **Important next step:** for disease traits, feed the returned
+        ``z_score`` directly into ``absolute_risk`` to get the concrete
+        lifetime probability and risk ratio vs the population average. This is
+        more informative than the percentile alone.
         """
         try:
             return _percentile_result(
@@ -765,6 +938,157 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             caveat=caveat,
         )
 
+    @mcp.tool(
+        annotations=ToolAnnotations(title="Compare genomes", readOnlyHint=True),
+    )
+    def compare_genomes(
+        result_paths: list[str],
+        genome_labels: list[str] | None = None,
+    ) -> GenomeComparison:
+        """Compare PRS results across multiple genomes for the same trait(s).
+
+        ``result_paths`` — list of JSON file paths produced by ``compute_prs_by_trait``
+        (the ``result_path`` field in each ``TraitPRSReport``). At least two paths are
+        required. Each file may cover a different genome but they are grouped by trait.
+
+        ``genome_labels`` — optional override labels (same length as ``result_paths``);
+        if omitted, labels are taken from each saved report's ``genome_label`` field or
+        inferred from the filename.
+
+        Returns a ``GenomeComparison`` with per-trait rankings (sorted high→low
+        percentile — **no directionality judgment**), percentile spread, model
+        consistency, and a ``most_divergent_traits`` list for the LLM to interpret.
+        """
+        if len(result_paths) < 2:
+            raise ToolError("compare_genomes requires at least 2 result paths.")
+
+        reports: list[TraitPRSReport] = []
+        for i, p in enumerate(result_paths):
+            fp = Path(p)
+            if not fp.is_file():
+                raise ToolError(f"Result file not found: {p}")
+            report = TraitPRSReport.model_validate_json(fp.read_text())
+            if genome_labels and i < len(genome_labels):
+                report.genome_label = genome_labels[i]
+            elif not report.genome_label:
+                report.genome_label = fp.stem.split("_")[0]
+            reports.append(report)
+
+        # Group reports by trait_id.
+        from collections import defaultdict
+
+        by_trait: dict[str, list[TraitPRSReport]] = defaultdict(list)
+        for r in reports:
+            by_trait[r.trait_id].append(r)
+
+        trait_comparisons: list[TraitComparison] = []
+        for trait_id, trait_reports in by_trait.items():
+            if len(trait_reports) < 2:
+                continue
+            label = trait_reports[0].label
+
+            # Pick best-model percentile per genome: highest-coverage reliable model.
+            rankings: list[GenomeRanking] = []
+            for tr in trait_reports:
+                reliable_rows = [
+                    row for row in tr.rows
+                    if row.status == "scored" and row.percentile is not None
+                    and row.percentile_reliable
+                ]
+                best_row = (
+                    max(reliable_rows, key=lambda r: r.match_rate or 0)
+                    if reliable_rows else None
+                )
+                rankings.append(GenomeRanking(
+                    genome_label=tr.genome_label or "unknown",
+                    best_pgs_id=best_row.pgs_id if best_row else None,
+                    percentile=best_row.percentile if best_row else None,
+                    n_models_scored=tr.n_scored,
+                    n_reliable=tr.n_reliable,
+                    rank=0,
+                ))
+
+            # Sort high→low percentile, assign ranks.
+            rankings.sort(
+                key=lambda g: g.percentile if g.percentile is not None else -1,
+                reverse=True,
+            )
+            for idx, g in enumerate(rankings):
+                g.rank = idx + 1
+
+            percentiles = [g.percentile for g in rankings if g.percentile is not None]
+            spread = max(percentiles) - min(percentiles) if len(percentiles) >= 2 else None
+
+            # Model consistency: check if the rank order is the same across all
+            # reliable models (not just the best one).
+            consistency = "consistent"
+            if len(rankings) >= 2 and all(g.percentile is not None for g in rankings):
+                top_label = rankings[0].genome_label
+                for tr in trait_reports:
+                    if tr.genome_label != top_label:
+                        continue
+                    alt_reliable = [
+                        row for row in tr.rows
+                        if row.status == "scored" and row.percentile is not None
+                        and row.percentile_reliable and row.pgs_id != rankings[0].best_pgs_id
+                    ]
+                    second_genome = [g for g in rankings if g.genome_label != top_label]
+                    if alt_reliable and second_genome:
+                        for alt_row in alt_reliable:
+                            for sg_report in trait_reports:
+                                if sg_report.genome_label != second_genome[0].genome_label:
+                                    continue
+                                sg_row = next(
+                                    (r for r in sg_report.rows if r.pgs_id == alt_row.pgs_id
+                                     and r.status == "scored" and r.percentile is not None),
+                                    None,
+                                )
+                                if (
+                                    sg_row
+                                    and sg_row.percentile is not None
+                                    and alt_row.percentile is not None
+                                    and sg_row.percentile > alt_row.percentile
+                                ):
+                                    consistency = "mixed"
+                                    break
+
+            trait_comparisons.append(TraitComparison(
+                trait_id=trait_id,
+                label=label,
+                rankings=rankings,
+                percentile_spread=spread,
+                model_consistency=consistency,
+            ))
+
+        # Sort most divergent traits.
+        divergent = sorted(
+            [tc for tc in trait_comparisons if tc.percentile_spread is not None],
+            key=lambda tc: tc.percentile_spread or 0,
+            reverse=True,
+        )
+
+        all_labels = list(dict.fromkeys(
+            r.genome_label or "unknown" for r in reports
+        ))
+
+        summary_parts = [
+            f"Compared {len(all_labels)} genomes across "
+            f"{len(trait_comparisons)} trait(s)."
+        ]
+        if divergent:
+            summary_parts.append(
+                f"Most divergent: {divergent[0].label} "
+                f"(spread {divergent[0].percentile_spread:.1f} percentile points)."
+            )
+
+        return GenomeComparison(
+            genome_labels=all_labels,
+            n_traits=len(trait_comparisons),
+            traits=trait_comparisons,
+            most_divergent_traits=[tc.label for tc in divergent],
+            summary=" ".join(summary_parts),
+        )
+
     @mcp.resource("resource://prs/panels")
     def panels() -> str:
         """Reference panels, supported genome builds, and the active cache directory."""
@@ -788,4 +1112,77 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             f"{vcf_path}. Search the PGS Catalog for relevant scores, normalize the "
             "VCF, compute the PRS for the most relevant score(s), and interpret the "
             "results (percentile and quality)."
+        )
+
+    @mcp.prompt
+    def interpret_prs_result(pgs_id: str, trait: str, percentile: str = "", score: str = "") -> str:
+        """Prompt template: interpret a single PRS result for a citizen scientist."""
+        header = (
+            f"Interpret this Polygenic Risk Score (PRS) result for a citizen scientist.\n\n"
+            f"Trait: {trait}\n"
+            f"PGS ID: {pgs_id}  https://www.pgscatalog.org/score/{pgs_id}/\n"
+        )
+        if percentile:
+            header += f"Percentile: {percentile}\n"
+        if score:
+            header += f"Raw PRS value: {score}\n"
+        return (
+            header + "\n"
+            "Please try to use the PGS Catalog page link above for extra context. "
+            "If you cannot access it, say that clearly instead of inventing details.\n\n"
+            "Structure your response as follows (under 250 words):\n"
+            "1. **Verdict** — one bold sentence (e.g. 'Your genetic score for [trait] "
+            "is moderately elevated (74th percentile) with moderate confidence.')\n"
+            "2. **Key numbers** — 2-4 bullet points: percentile meaning, match "
+            "quality, model confidence in plain language.\n"
+            "3. **Context** — 1-2 sentences: what this trait IS (health, behavioral, "
+            "physical, cognitive — do NOT assume health), how much genetics vs "
+            "environment matters, why PRS is one factor among many.\n"
+            "4. **What to do** — 1-2 sentences: only if actionable (screening for "
+            "health traits). For non-health traits, say no action is needed and why.\n"
+            "Citizen scientist audience — clarity and honesty over length.\n\n"
+            "After the main section, you MAY add a clearly separated section "
+            "(use a horizontal rule ---) with additional commentary: caveats, "
+            "ancestry considerations, trait-specific biology, or links to further "
+            "reading. This optional section has no word limit but should earn its "
+            "length — only include it if you have genuinely useful additional context."
+        )
+
+    @mcp.prompt
+    def interpret_trait_results(trait: str, n_models: str = "", best_pgs_id: str = "") -> str:
+        """Prompt template: interpret combined PRS results across multiple models for one trait."""
+        header = (
+            f"Interpret these combined Polygenic Risk Score (PRS) results for "
+            f"\"{trait}\".\n\n"
+        )
+        if n_models:
+            header += f"Models computed: {n_models}\n"
+        if best_pgs_id:
+            header += (
+                f"Best model: {best_pgs_id}  "
+                f"https://www.pgscatalog.org/score/{best_pgs_id}/\n"
+            )
+        return (
+            header + "\n"
+            "Please try to use the PGS Catalog page link above for extra context. "
+            "If you cannot access it, say that clearly instead of inventing details.\n\n"
+            "Structure your response as follows (under 300 words):\n"
+            "1. **Verdict** — one bold sentence (e.g. 'Five models consistently "
+            "place your [trait] score in the top 10% with moderate confidence.')\n"
+            "2. **Model agreement** — 2-3 bullet points: do models agree, percentile "
+            "spread, which model is best and why.\n"
+            "3. **What the percentile means** — 1-2 sentences in plain language. "
+            "This is a genetic predisposition score, not a measurement of the trait "
+            "itself.\n"
+            "4. **Confidence** — 1-2 sentences: combine model coverage, quality "
+            "tier, and number of high-quality models into an honest statement.\n"
+            "5. **Context & actions** — 1-2 sentences: what this trait IS (health, "
+            "behavioral, physical, cognitive — do NOT assume health), and whether "
+            "any action makes sense. For non-health traits, say no action is needed.\n"
+            "Citizen scientist audience — clarity and honesty over length.\n\n"
+            "After the main section, you MAY add a clearly separated section "
+            "(use a horizontal rule ---) with additional commentary: caveats, "
+            "ancestry considerations, trait-specific biology, or links to further "
+            "reading. This optional section has no word limit but should earn its "
+            "length — only include it if you have genuinely useful additional context."
         )

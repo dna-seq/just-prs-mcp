@@ -54,5 +54,11 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 3011
 
+    # Agno agent (dev-only; the MCP server itself needs none of these).
+    agent_api_key: str | None = None
+    agent_model_id: str = "gemini-flash-latest"
+    agent_base_url: str | None = None
+    agent_timeout: float = 120.0
+
     # Logging (stdlib logging -> stderr; stdout stays a clean JSON-RPC channel).
     log_level: str = "INFO"

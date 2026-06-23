@@ -291,8 +291,7 @@ def register_extended(mcp: FastMCP, settings: Settings) -> None:
             n_matches=len(rows),
             rows=rows,
             message=(
-                f"Found {len(rows)} prevalence prior row(s) for "
-                f"{', '.join(expanded)}."
+                f"Found {len(rows)} prevalence prior row(s) for {', '.join(expanded)}."
                 if rows
                 else f"No prevalence prior in the catalog for {', '.join(expanded)}."
             ),

@@ -11,6 +11,24 @@ FastMCP template; the cake demo has been replaced with real PRS tools, but the
 template's patterns (mode gating, background tasks, structured I/O, in-memory
 tests) are kept.
 
+## Pre-configured Test Genomes
+
+For testing, benchmarking, or demonstration purposes, two public whole-genome sequencing (WGS) datasets are pre-configured in the server's `download_sample_genome` tool:
+
+- **Anton Kulaga's Genome** (CC0 / Public Domain): [Zenodo Record 18370498](https://zenodo.org/records/18370498)
+  - VCF File: `antonkulaga.vcf` (~482 MB)
+  - Parameter: `sample="anton"`
+- **Livia Zaharia's Genome** (CC-BY-4.0): [Zenodo Record 19487816](https://zenodo.org/records/19487816)
+  - VCF File: `SIMHIFQTILQ.hard-filtered.vcf.gz` (~349 MB)
+  - Parameter: `sample="livia"`
+
+### Quick Play for Agents:
+If you are asked to demonstrate or test any PRS computation or VCF normalization, you can download and use these genomes automatically:
+1. Call `download_sample_genome(sample="anton")` or `download_sample_genome(sample="livia")`.
+2. The tool runs as a background task and returns the local file path on success.
+3. Pass that path to `normalize_vcf` to generate a normalized genotype Parquet file.
+4. Pass the normalized Parquet file to `compute_prs` or `compute_prs_batch` to compute Polygenic Risk Scores.
+
 ## Commands (prefer these)
 
 ```bash
@@ -82,10 +100,10 @@ call and returns a friendly `OpResult(success=False)` if none is set.
   → return `OpResult(success=False)` (or a clear `ToolError` for `pgenlib`).
 - Server-side logs use stdlib `logging` and **must** go to stderr
   (`logging_setup.py`); client-facing messages use `ctx.info`/`ctx.report_progress`.
-- Pin to the **installed** just-prs API (currently 0.4.9) — verify signatures
+- Pin to the **installed** just-prs API (currently 0.4.12) — verify signatures
   against the installed wheel, not an unpublished source tree (they can diverge
   under the same version number). E.g. `PRSCatalog.compute_prs_batch` returns a
-  `list[PRSResult]` and takes no `genotypes`/`memory_limit`.
+  `PRSBatchResult` and accepts `genotypes_lf`.
 - Line length 100; ruff rules in `pyproject.toml`.
 
 ## Testing notes

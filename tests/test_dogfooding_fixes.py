@@ -262,15 +262,27 @@ class FakePerfCatalog:
         return _batch_result(out)
 
     def percentile_full(
-        self, prs_score, pgs_id, ancestry="EUR", mean=0.0, std=None, panel="1000g",
+        self,
+        prs_score,
+        pgs_id,
+        ancestry="EUR",
+        mean=0.0,
+        std=None,
+        panel="1000g",
         weight_mass_coverage=None,
     ):
         from just_prs.models import PercentileResult
 
         return PercentileResult(
-            percentile=82.0, method="reference_panel", z_score=0.9,
-            reference_mean=0.0, reference_std=1.0, reliable=True, caveat="",
-            ancestry=ancestry.upper(), panel=panel,
+            percentile=82.0,
+            method="reference_panel",
+            z_score=0.9,
+            reference_mean=0.0,
+            reference_std=1.0,
+            reliable=True,
+            caveat="",
+            ancestry=ancestry.upper(),
+            panel=panel,
         )
 
 
@@ -315,7 +327,11 @@ async def test_compute_prs_genotypes_path_attaches_performance(
 
     class FakeSingleCatalog:
         def compute_prs(
-            self, vcf_path, pgs_id, genome_build="GRCh38", attach_performance=False,
+            self,
+            vcf_path,
+            pgs_id,
+            genome_build="GRCh38",
+            attach_performance=False,
             genotypes_lf=None,
         ):
             from just_prs.models import PRSResult
@@ -323,8 +339,12 @@ async def test_compute_prs_genotypes_path_attaches_performance(
             captured["genotypes_lf_is_set"] = genotypes_lf is not None
             captured["attach_performance"] = attach_performance
             return PRSResult(
-                pgs_id=pgs_id, score=2.0, variants_matched=800, variants_total=1000,
-                match_rate=0.8, weight_mass_coverage=0.7,
+                pgs_id=pgs_id,
+                score=2.0,
+                variants_matched=800,
+                variants_total=1000,
+                match_rate=0.8,
+                weight_mass_coverage=0.7,
             )
 
     monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeSingleCatalog())
@@ -360,7 +380,9 @@ class FakeRiskFromScoreCatalog:
         from just_prs.models import AbsoluteRiskBundle
 
         self.from_score_args = {
-            "pgs_id": pgs_id, "score": score, "ancestry": ancestry,
+            "pgs_id": pgs_id,
+            "score": score,
+            "ancestry": ancestry,
             "weight_mass_coverage": weight_mass_coverage,
         }
         return AbsoluteRiskBundle(agreement="single")
@@ -381,7 +403,10 @@ async def test_absolute_risk_bundle_from_raw_score(extended_client, monkeypatch)
 
     assert result.data.agreement == "single"
     assert fake.from_score_args == {
-        "pgs_id": "PGS000014", "score": 14.9, "ancestry": "EUR", "weight_mass_coverage": 0.85,
+        "pgs_id": "PGS000014",
+        "score": 14.9,
+        "ancestry": "EUR",
+        "weight_mass_coverage": 0.85,
     }
 
 
@@ -442,9 +467,7 @@ async def test_prevalence_info_by_mondo_trait_id(extended_client, monkeypatch):
 
     monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakePrevalenceCatalog())
 
-    result = await extended_client.call_tool(
-        "prevalence_info", {"trait_id": "MONDO_0005148"}
-    )
+    result = await extended_client.call_tool("prevalence_info", {"trait_id": "MONDO_0005148"})
 
     assert result.data.n_matches == 1
     assert result.data.rows[0].xref_mondo == "MONDO_0005148"
