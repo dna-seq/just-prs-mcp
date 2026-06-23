@@ -39,7 +39,11 @@ def _score_summary(row: dict) -> ScoreSummary:
         trait_reported=row.get("trait_reported"),
         trait_efo=row.get("trait_efo"),
         genome_build=row.get("genome_build"),
-        variants_number=row.get("variants_number"),
+        # just-prs's cleaned scores sheet names this column ``n_variants`` (see
+        # cleanup._SCORES_COLUMN_RENAME); reading ``variants_number`` returned null
+        # for every score (dogfooding F21). ``is_harmonized`` is genuinely absent
+        # from the cleaned sheet — left null pending an upstream column (F21/F19).
+        variants_number=row.get("n_variants", row.get("variants_number")),
         weight_type=row.get("weight_type"),
         is_harmonized=row.get("is_harmonized"),
         quality_label=row.get("quality_label"),

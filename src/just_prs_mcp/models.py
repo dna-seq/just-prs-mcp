@@ -152,6 +152,17 @@ class TraitScoreRow(BaseModel):
     pgs_id: str = Field(description="PGS Catalog Score ID.")
     status: str = Field(description="'scored' or 'failed'.")
     score: float | None = Field(default=None, description="Computed PRS value.")
+    genome_build: str | None = Field(
+        default=None, description="Score's native genome build from the catalog (e.g. 'GRCh38')."
+    )
+    variants_number: int | None = Field(
+        default=None,
+        description="Number of variants in the published score (catalog metadata) — the "
+        "denominator that distinguishes a genome-wide model from a few-SNP toy score.",
+    )
+    weight_type: str | None = Field(
+        default=None, description="Weight type from the catalog (beta / OR / HR / NR)."
+    )
     variants_matched: int | None = Field(default=None, description="Matched scoring variants.")
     variants_total: int | None = Field(default=None, description="Total scoring variants.")
     match_rate: float | None = Field(default=None, description="Matched / total scoring variants.")
@@ -217,6 +228,31 @@ class TraitPRSReport(BaseModel):
         description="Rows computed but trimmed from the response by ``top_n`` "
         "(trait-level counts still reflect all scores).",
     )
+    profile: str = Field(
+        default="curated",
+        description="Curation profile applied: 'curated' (criteria-filtered shortlist) or "
+        "'all' (every associated score).",
+    )
+    n_filtered: int = Field(
+        default=0,
+        description="Scored rows dropped by the profile/filter criteria before ``top_n`` "
+        "trimming (distinct from n_omitted, which is the top_n cut).",
+    )
+    filter_summary: str | None = Field(
+        default=None,
+        description="Human-readable explanation of which curation/filter criteria dropped "
+        "rows and how many — so trimming is explicit, never silent.",
+    )
+    needs_extended: bool = Field(
+        default=False,
+        description="True when the request reached for an extended-only capability (e.g. raw "
+        "curation override / match-rate tuning). See needs_extended_hint.",
+    )
+    needs_extended_hint: str | None = Field(
+        default=None,
+        description="If needs_extended, names the env/CLI switch to re-launch with "
+        "(PRS_MCP_MODE=extended / --mode extended) and what it unlocks.",
+    )
     rows: list[TraitScoreRow] = Field(
         description="Per-score results (ranked best-coverage first; trimmed to ``top_n`` when set)."
     )
@@ -231,6 +267,32 @@ class TraitPRSReport(BaseModel):
         description="Path where this result was auto-saved as JSON. Pass to ``compare_genomes`` "
         "to build a cross-genome comparison without re-serializing the full report.",
     )
+
+
+class TraitPanelPlot(BaseModel):
+    """A Plotly figure spec for a trait's PRS panel (client renders it).
+
+    Returns the figure as a JSON-serializable Plotly object rather than a
+    server-rendered image, so the client can drop it into an HTML+JS page,
+    restyle it, or rasterize it to taste — and the server needs no heavy
+    rendering dependency (dogfooding F27).
+    """
+
+    trait_id: str = Field(description="Trait ontology ID plotted.")
+    label: str = Field(description="Trait label.")
+    plot_format: str = Field(default="plotly", description="Figure spec format ('plotly').")
+    figure: dict = Field(
+        description="Plotly figure spec ({data, layout}) — pass to Plotly.newPlot or "
+        "plotly.io.from_json. Markers are one-per-scored-model on a reference normal "
+        "curve: marker shape encodes quality tier, color encodes reliability/outlier."
+    )
+    n_markers: int = Field(description="Number of model markers placed on the curve.")
+    html: str | None = Field(
+        default=None,
+        description="Optional self-contained HTML page (loads plotly.js from CDN) rendering "
+        "the figure — present only when include_html=True. Save and open in a browser.",
+    )
+    summary: str = Field(description="Human-readable summary of what was plotted.")
 
 
 class PrevalenceRow(BaseModel):

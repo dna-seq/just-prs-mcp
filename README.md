@@ -96,6 +96,38 @@ directory, no database. Every setting is optional.
 
 ## Using with Claude, Cursor, Codex, Antigravity, or other agents
 
+### Hosted server — nothing to install
+
+A public instance is hosted at **`https://just-prs-mcp.just-dna.life/mcp`** (HTTP
+transport). Point any MCP client at it — no Python, no `uvx`, no local cache.
+
+**Claude Code:**
+
+```bash
+claude mcp add --transport http just-prs https://just-prs-mcp.just-dna.life/mcp
+```
+
+**Cursor / Claude Desktop / other `mcpServers` JSON:**
+
+```json
+{
+  "mcpServers": {
+    "just-prs": {
+      "type": "http",
+      "url": "https://just-prs-mcp.just-dna.life/mcp"
+    }
+  }
+}
+```
+
+> **Hosted instance only serves the two built-in sample genomes.** Computation
+> tools take **server-side** file paths, and the hosted server provides **no
+> upload or fetch path for your own VCF** — by design, to avoid persisting
+> personal genomic data on a remote host. You can therefore only score the
+> pre-loaded public samples — **Anton Kulaga** (`sample="anton"`) and **Livia
+> Zaharia** (`sample="livia"`) — via `download_sample_genome`. To analyze **your
+> own** genome, run the server **locally** (below) against your own filesystem.
+
 ### Published package — no clone needed
 
 The server is on [PyPI](https://pypi.org/project/just-prs-mcp/), so any MCP

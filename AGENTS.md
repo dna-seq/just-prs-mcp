@@ -79,6 +79,29 @@ There is **no auth tier** — just-prs needs no API key. The one credentialed to
 (`push_catalog_to_hf`) resolves a token from `PRS_MCP_HF_TOKEN` / `HF_TOKEN` per
 call and returns a friendly `OpResult(success=False)` if none is set.
 
+### Mode → tool map (F23)
+
+- **Essentials (always on):**
+  - `tools/catalog.py`: `search_scores`, `score_info`, `best_performance`,
+    `search_traits`, `trait_info`.
+  - `tools/compute.py`: `normalize_vcf`, `download_sample_genome`, `list_genomes`,
+    `compute_prs`, `compute_prs_batch`, `compute_prs_by_trait` (curated by default;
+    `profile`/`min_match_rate`/`min_auroc`/`build`/`ancestry` filters),
+    `percentile`, `absolute_risk`, `assess_quality`, `compare_genomes`,
+    `plot_trait_panel`. Prompts: `compute_prs_for_trait`,
+    `interpret_prs_for_trait`, `interpret_prs_result`, `interpret_trait_results`.
+- **Extended only (`PRS_MCP_MODE=extended` / `--mode extended`):**
+  - `tools/extended.py`: `normalize_array`, `download_scoring_file`,
+    `list_pgs_ids`, `download_all_metadata`, `bulk_download_scores`,
+    `prevalence_info`, `absolute_risk_bundle`, `push_catalog_to_hf`.
+  - `tools/reference.py`: `download_reference_panel`, `reference_score`,
+    `reference_score_batch`, `pgen_read_pvar`, `pgen_read_psam`, `pgen_score`.
+
+Essentials tools that bump the gate surface a `needs_extended` breadcrumb (e.g.
+`compute_prs_by_trait` sets `needs_extended` + `needs_extended_hint` when raw
+`min_match_rate` / `min_auroc` knobs are used). There is deliberately **no**
+client→server VCF upload/fetch tool — see dogfooding F24 (privacy/compliance).
+
 ## How to add a tool
 
 1. Pick the module/tier: catalog or compute (essentials), extended, or reference.

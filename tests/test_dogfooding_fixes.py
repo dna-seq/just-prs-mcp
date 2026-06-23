@@ -213,7 +213,8 @@ async def test_compute_prs_by_trait_top_n_trims_and_ranks(essentials_client, mon
 
     result = await essentials_client.call_tool(
         "compute_prs_by_trait",
-        {"trait_id": "MONDO_0005148", "vcf_path": str(vcf), "top_n": 2},
+        # profile="all": exercise top_n trimming itself, not the curated criteria.
+        {"trait_id": "MONDO_0005148", "vcf_path": str(vcf), "top_n": 2, "profile": "all"},
     )
     report = result.data
 
@@ -732,3 +733,267 @@ def test_zenodo_helpers_resolve_samples_and_pick_vcf():
     named = _pick_vcf_file(files, "small.vcf.gz")
     assert named is not None and named["key"] == "small.vcf.gz"
     assert _pick_vcf_file([{"key": "x.txt", "size": 1, "links": {}}], None) is None
+
+
+# --- F21: filterable by-trait report + curated profile + new columns ---
+
+
+class FakeCuratedRest:
+    """Trait carrying four associated PGS IDs for curation tests."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def get_trait(self, trait_id: str) -> TraitInfo:
+        return TraitInfo(
+            id=trait_id,
+            label="gout",
+            description=None,
+            url="https://example.test/trait",
+            trait_categories=[],
+            trait_synonyms=[],
+            associated_pgs_ids=["PGS000001", "PGS000002", "PGS000003", "PGS000004"],
+            child_associated_pgs_ids=[],
+        )
+
+
+class FakeCuratedCatalog:
+    """Batch + metadata catalog exercising every curated criterion.
+
+    PGS000001 good genome-wide (kept); PGS000002 toy (<10 variants, dropped);
+    PGS000003 no performance evidence (dropped); PGS000004 shares PGS000001's
+    publication family but has lower coverage (deduped out).
+    """
+
+    _META = {
+        "PGS000001": {
+            "n_variants": 500000,
+            "weight_type": "beta",
+            "genome_build": "GRCh38",
+            "pgp_id": "PGP01",
+        },
+        "PGS000002": {
+            "n_variants": 3,
+            "weight_type": "beta",
+            "genome_build": "GRCh38",
+            "pgp_id": "PGP02",
+        },
+        "PGS000003": {
+            "n_variants": 400000,
+            "weight_type": "beta",
+            "genome_build": "GRCh38",
+            "pgp_id": "PGP03",
+        },
+        "PGS000004": {
+            "n_variants": 480000,
+            "weight_type": "beta",
+            "genome_build": "GRCh37",
+            "pgp_id": "PGP01",
+        },
+    }
+    _HAS_PERF = {"PGS000001", "PGS000002", "PGS000004"}
+    _COV = {"PGS000001": 0.85, "PGS000002": 0.95, "PGS000003": 0.85, "PGS000004": 0.60}
+
+    def score_info_row(self, pgs_id: str):
+        row = self._META.get(pgs_id)
+        return {"pgs_id": pgs_id, **row} if row else None
+
+    def compute_prs_batch(
+        self, vcf_path, pgs_ids, genome_build, genotypes_lf=None, attach_performance=False
+    ):
+        from just_prs.models import EffectSizeInfo, PerformanceInfo, PRSResult
+
+        out = []
+        for pgs_id in pgs_ids:
+            perf = None
+            if attach_performance and pgs_id in self._HAS_PERF:
+                perf = PerformanceInfo(
+                    ppm_id="PPM1",
+                    effect_sizes=[
+                        EffectSizeInfo(name_short="OR", estimate=1.55, ci_lower=1.50, ci_upper=1.60)
+                    ],
+                    class_acc=[EffectSizeInfo(name_short="AUROC", estimate=0.78)],
+                    sample_number=1000,
+                    ancestry_broad="European",
+                )
+            out.append(
+                PRSResult(
+                    pgs_id=pgs_id,
+                    score=1.0,
+                    variants_matched=int(1000 * self._COV[pgs_id]),
+                    variants_total=1000,
+                    match_rate=0.9,
+                    weight_mass_coverage=self._COV[pgs_id],
+                    performance=perf,
+                    detected_genome_build="GRCh38",
+                )
+            )
+        return _batch_result(out)
+
+    def percentile_full(
+        self,
+        prs_score,
+        pgs_id,
+        ancestry="EUR",
+        mean=0.0,
+        std=None,
+        panel="1000g",
+        weight_mass_coverage=None,
+    ):
+        from just_prs.models import PercentileResult
+
+        return PercentileResult(
+            percentile=82.0,
+            method="reference_panel",
+            z_score=0.9,
+            reference_mean=0.0,
+            reference_std=1.0,
+            reliable=True,
+            caveat="",
+            ancestry=ancestry.upper(),
+            panel=panel,
+        )
+
+
+async def test_compute_prs_by_trait_profile_all_populates_columns(
+    essentials_client, monkeypatch, tmp_path
+):
+    """F21: profile='all' returns every score and joins the new catalog columns."""
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_rest_client", FakeCuratedRest)
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeCuratedCatalog())
+
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text("##fileformat=VCFv4.2\n")
+
+    result = await essentials_client.call_tool(
+        "compute_prs_by_trait",
+        {"trait_id": "MONDO_0005393", "vcf_path": str(vcf), "interpret": True, "profile": "all"},
+    )
+    report = result.data
+
+    assert report.profile == "all"
+    assert report.n_scored == 4 and report.n_returned == 4 and report.n_filtered == 0
+    by_id = {r.pgs_id: r for r in report.rows}
+    assert by_id["PGS000001"].variants_number == 500000
+    assert by_id["PGS000001"].weight_type == "beta"
+    assert by_id["PGS000001"].genome_build == "GRCh38"
+    assert report.needs_extended is False
+
+
+async def test_compute_prs_by_trait_curated_applies_criteria(
+    essentials_client, monkeypatch, tmp_path
+):
+    """F21: curated drops toy / no-evidence / dup-family scores and reports why."""
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_rest_client", FakeCuratedRest)
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeCuratedCatalog())
+
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text("##fileformat=VCFv4.2\n")
+
+    result = await essentials_client.call_tool(
+        "compute_prs_by_trait",
+        {"trait_id": "MONDO_0005393", "vcf_path": str(vcf), "interpret": True},
+    )
+    report = result.data
+
+    # Trait-level counts still reflect all four computed scores.
+    assert report.profile == "curated"
+    assert report.n_scored == 4
+    # Only the genome-wide, performance-backed, best-in-family score survives.
+    assert [r.pgs_id for r in report.rows] == ["PGS000001"]
+    assert report.n_filtered == 3
+    assert report.filter_summary and "dropped 3" in report.filter_summary
+
+
+async def test_compute_prs_by_trait_raw_knobs_set_needs_extended(
+    essentials_client, monkeypatch, tmp_path
+):
+    """F23: passing a raw filter knob flips the needs_extended breadcrumb + hint."""
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_rest_client", FakeCuratedRest)
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeCuratedCatalog())
+
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text("##fileformat=VCFv4.2\n")
+
+    result = await essentials_client.call_tool(
+        "compute_prs_by_trait",
+        {
+            "trait_id": "MONDO_0005393",
+            "vcf_path": str(vcf),
+            "interpret": True,
+            "profile": "all",
+            "min_auroc": 0.5,
+        },
+    )
+    report = result.data
+
+    assert report.needs_extended is True
+    assert report.needs_extended_hint and "extended" in report.needs_extended_hint
+
+
+async def test_plot_trait_panel_builds_plotly_figure(essentials_client, monkeypatch, tmp_path):
+    """F27: plot_trait_panel turns a saved report into a Plotly figure with one
+    marker per scored, percentiled model."""
+    from just_prs_mcp import client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "make_rest_client", FakeCuratedRest)
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: FakeCuratedCatalog())
+
+    vcf = tmp_path / "sample.vcf"
+    vcf.write_text("##fileformat=VCFv4.2\n")
+
+    report = (
+        await essentials_client.call_tool(
+            "compute_prs_by_trait",
+            {
+                "trait_id": "MONDO_0005393",
+                "vcf_path": str(vcf),
+                "interpret": True,
+                "profile": "all",
+            },
+        )
+    ).data
+    assert report.result_path
+
+    plot = (
+        await essentials_client.call_tool(
+            "plot_trait_panel", {"result_path": report.result_path, "include_html": True}
+        )
+    ).data
+
+    assert plot.plot_format == "plotly"
+    assert plot.n_markers == 4  # all four scored rows carry a percentile
+    # Two traces: the reference curve and the model markers.
+    assert len(plot.figure["data"]) == 2
+    assert plot.figure["data"][1]["x"] == [82.0, 82.0, 82.0, 82.0]
+    assert plot.html and "plotly" in plot.html.lower()
+
+
+async def test_interpret_prs_for_trait_prompt_registered(essentials_client):
+    """F21: the methodology prompt ships server-side for every client."""
+    names = {p.name for p in await essentials_client.list_prompts()}
+    assert "interpret_prs_for_trait" in names
+
+
+async def test_score_info_variants_number_reads_n_variants(essentials_client, monkeypatch):
+    """F21: score_info surfaces variants_number from the cleaned 'n_variants' column
+    (previously always null because the wrong key was read)."""
+    from just_prs_mcp import client as mcp_client
+
+    class _MetaCatalog:
+        def score_info_row(self, pgs_id):
+            return {"pgs_id": pgs_id, "n_variants": 123456, "weight_type": "beta"}
+
+    monkeypatch.setattr(mcp_client, "make_catalog", lambda settings: _MetaCatalog())
+
+    result = await essentials_client.call_tool("score_info", {"pgs_id": "PGS000001"})
+    assert result.data.variants_number == 123456

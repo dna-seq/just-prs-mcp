@@ -288,3 +288,65 @@ only to the sample-download path; a user's own **local** VCF still needs an expl
 `normalize_vcf` call (no download step to fold it into). `tools/compute.py`
 (`download_sample_genome`); AGENTS.md Quick-Play updated. Verified by
 `test_download_sample_genome_auto_normalizes_by_default`.
+
+---
+
+**2026-06-23 — wrapper-actionable dogfooding pass.** F21, F23 (mode gate), and F27 were
+resolved entirely in the wrapper; F24 was deliberately declined (see `docs/dogfooding.md`).
+Upstream remainders (F19/F21 column slice; F27 per-individual distribution) are tracked in
+`docs/just-prs-pending-fixes.md`.
+
+## F21 — Trait report is filterable; the axes that matter are columns *(resolved)*
+
+`compute_prs_by_trait` (`tools/compute.py`) now:
+
+- **Joins catalog metadata columns** onto every `TraitScoreRow`: `genome_build`,
+  `variants_number`, `weight_type` (via `_score_metadata_map`, one batched
+  `score_info_row` pass — no per-score REST round-trip). This also fixed a latent bug:
+  `_score_summary` (`tools/catalog.py`) read `variants_number` but the cleaned scores
+  column is `n_variants`, so `score_info` had been returning null for every score; it now
+  reads `n_variants`. (`is_harmonized` + development ancestry / dev sample size are *not*
+  in the cleaned sheet — deferred upstream, `just-prs-pending-fixes.md` F19/F21 slice.)
+- **Filter/rank params:** `min_match_rate`, `min_auroc`, `build`, `ancestry` drop rows
+  before `top_n` trimming; drops are reported in `filter_summary` / `n_filtered`, never
+  silent.
+- **`profile="curated"` (default) | `"all"`:** curated applies live criteria — no-toy
+  guard (<10 variants), has-performance-evidence, C_wt coverage floor (0.20), and
+  score-family dedup (best per `pgp_id`) — returning an interpreted shortlist; `all`
+  returns the raw panel. Criteria, not a hard-coded ID list (`_apply_curation`).
+- **`interpret_prs_for_trait` MCP prompt** encodes the 5-stage recipe (resolve → confirm
+  ancestry → curated by-trait → read concordance → caveats), so every client gets the
+  methodology. The **`prs-trait-interpretation` skill**
+  (`.claude/skills/prs-trait-interpretation/SKILL.md`) is a thin wrapper over it.
+
+Verified by `test_compute_prs_by_trait_profile_all_populates_columns`,
+`test_compute_prs_by_trait_curated_applies_criteria`,
+`test_interpret_prs_for_trait_prompt_registered`,
+`test_score_info_variants_number_reads_n_variants`.
+
+## F23 (mode gate) — Extended-only capabilities are visible; `needs_extended` breadcrumb *(resolved)*
+
+> Note: the number **F23** is reused — `docs/previous_issues.md` also has an *F23 —
+> single-score `genotypes_lf`* entry (an unrelated upstream library item). This entry is
+> the dogfooding "agent can't see the mode gate" finding.
+
+Threefold fix: (1) the server `instructions` now carry a **"Tool modes"** section that
+crisply enumerates the extended-only capabilities and the switch
+(`PRS_MCP_MODE=extended` / `--mode extended`), plus a "Getting genotypes onto the server"
+note (`server.py`); (2) `compute_prs_by_trait` emits a `needs_extended` breadcrumb +
+`needs_extended_hint` on its `TraitPRSReport` when a request reaches for a raw curation
+knob (`min_match_rate` / `min_auroc`); (3) **AGENTS.md** gained an explicit mode→tool map.
+Verified by `test_compute_prs_by_trait_raw_knobs_set_needs_extended` and the modes tests.
+
+## F27 — Plotting via a Plotly figure spec (client renders) *(resolved; richer chart upstream)*
+
+`plot_trait_panel(result_path, include_html=False)` (`tools/compute.py`) reads a saved
+`TraitPRSReport` and returns a `TraitPanelPlot` carrying a **Plotly figure dict**
+({data, layout}) — a theoretical normal curve with one marker per scored model at its
+percentile, marker shape = quality tier and color = reliability/outlier, mirroring
+prs-ui's `bell_curve` (`_bell_marker` / `_trait_panel_figure`, reimplemented locally since
+prs-ui is a separate Reflex app — no import). `include_html=True` also returns a
+self-contained HTML page (CDN plotly.js). JSON over server-rendered PNG keeps the figure
+editable client-side and the server render-dependency-free. The richer empirical-cohort
+histogram is deferred upstream (`just-prs-pending-fixes.md` F27). Verified by
+`test_plot_trait_panel_builds_plotly_figure`.

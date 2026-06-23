@@ -193,6 +193,75 @@ knows which panel it used — surface that panel ancestry and flag obvious
 mismatches; expose ancestry as a `TraitScoreRow` column once the library returns
 it (tracked as a report column in dogfooding F21).
 
+### F19/F21 column slice — development ancestry, dev sample size, and `is_harmonized` aren't in the cleaned scores sheet *(upstream, wrapper-blocked)*
+
+The MCP wrapper's F21 work added `genome_build`, `variants_number`, and `weight_type`
+columns to the trait report (all live in `just-prs`'s cleaned scores sheet —
+`cleanup._SCORES_COLUMN_RENAME`, mapping `Number of Variants → n_variants`,
+`Type of Variant Weight → weight_type`). Three filterable axes the dogfooding recipe
+wants are **not** in that sheet, so the wrapper leaves them null:
+
+- **Per-score development ancestry** — lives in the PGS Catalog "Ancestry Distribution"
+  (GWAS + Dev) metadata, which `just-prs` does not currently clean/expose. This is the
+  F19 development-ancestry slice; without it the wrapper can only surface the
+  *reference-panel* ancestry, not the *training* ancestry, so the score×sample×panel
+  coherence veto stays unbuildable.
+- **Development (training) sample size** — same sheet; distinct from the *evaluation*
+  `n_individuals` already surfaced via `best_performance` / `PerformanceInfo`.
+- **`is_harmonized`** — there is no such column in the cleaned scores sheet at all
+  (`_score_summary` reads a key that never exists, so `score_info.is_harmonized` is
+  always null). Either derive it (native `genome_build` vs the harmonized build actually
+  scored) or add it to the cleaned sheet.
+
+Library fix: clean + expose the Ancestry Distribution sheet (development ancestry +
+dev sample size, keyed by `pgs_id`) and either populate or derive `is_harmonized`. The
+wrapper will join them onto `TraitScoreRow` the moment they are available
+(`_score_metadata_map` / `_trait_score_row`, `tools/compute.py`).
+
+## F27 — No per-individual reference distribution to plot a true cohort histogram *(upstream; blocks the richest plot)*
+
+**Status: NEW (2026-06-23), from the remote-deployment plotting pass.** The MCP wrapper
+now ships `plot_trait_panel`, which returns a **Plotly figure spec (JSON)** the client
+renders — a *theoretical* normal curve with one marker per scored model placed at its
+percentile (marker shape = quality tier, color = reliability/outlier), mirroring the
+existing prs-ui `bell_curve` data shape (`prs-ui/prs_ui/mixin.py`,
+`_quality_marker_shape` / `_bell_curve_marker` / the `percentile_chart` dict). That works
+with today's data and needs no server-side render dependency.
+
+What it **cannot** do today is the more informative chart: a **histogram of the 2,504
+1000G reference individuals' scores with the user's score marked**. The library exposes
+only *aggregated* per-superpopulation summary stats (`ReferenceDistribution`: mean / std /
+p5 / p25 / p75 / p95, `models.py`) and per-superpop percentiles — not the per-individual
+PRS values. The per-individual scores exist on disk
+(`cache/reference_scores/{panel}/{pgs_id}/`) but `aggregate_distributions` /
+`ancestry_distribution_stats` (`reference.py` ~2459–2610) only return the summary.
+
+**Recommended exposure (`just-prs` core, code at `/data/sources/just-prs`):** add a public
+accessor returning the per-individual reference scores for a (pgs_id, superpopulation),
+e.g.
+
+```python
+# just_prs/prs_catalog.py (or reference.py)
+def reference_individual_scores(
+    self, pgs_id: str, superpopulation: str | None = None, panel: str = "1000g"
+) -> pl.LazyFrame:
+    """Per-individual reference PRS: columns (iid, superpopulation, prs_score)."""
+```
+
+backed by the already-cached `reference_scores/{panel}/{pgs_id}/` parquet (no recompute,
+no download). With that, the wrapper can add a `plot_prs_distribution(pgs_id, score)` tool
+that builds an empirical histogram + the user's marker — far more interpretable than the
+theoretical curve.
+
+**Recommended exposure (prs-ui — has a UI update due):** the Reflex app's `bell_curve`
+renderer currently consumes the `percentile_chart` dict (theoretical curve + markers). To
+show the empirical cohort, have prs-ui consume the new `reference_individual_scores`
+LazyFrame and render a histogram trace (one per superpopulation, optionally faceted) with
+the user's score as a vertical rule — reusing the existing quality→shape / reliability→
+color encoding for the user's marker. This keeps the MCP `plot_trait_panel` JSON and the
+prs-ui chart fed from the **same** library accessor, so they can't drift. Until the
+accessor lands, both surfaces stay on the theoretical-normal approximation.
+
 ## F20 — Coverage reliability gate is absolute and perversely selects trivially small scores — extends F9/F15
 
 **Status: PARTIALLY RESOLVED — the inverting metric shipped in `just-prs` **0.4.8**

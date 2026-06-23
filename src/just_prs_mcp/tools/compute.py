@@ -33,6 +33,7 @@ from just_prs_mcp.models import (
     PRSResult,
     QualityAssessment,
     TraitComparison,
+    TraitPanelPlot,
     TraitPRSReport,
     TraitScoreRow,
 )
@@ -153,6 +154,7 @@ def _trait_score_row(
     interpret: bool,
     superpopulation: str,
     panel: str | None,
+    meta: dict | None = None,
 ) -> TraitScoreRow:
     percentile_result = None
     quality = None
@@ -190,10 +192,15 @@ def _trait_score_row(
             caveat=(percentile_result.caveat or "") if percentile_result else "",
         )
 
+    meta = meta or {}
     return TraitScoreRow(
         pgs_id=result.pgs_id,
         status="scored",
         score=result.score,
+        genome_build=meta.get("genome_build"),
+        # ``n_variants`` is the cleaned-scores column name (see catalog._score_summary).
+        variants_number=meta.get("n_variants"),
+        weight_type=meta.get("weight_type"),
         variants_matched=result.variants_matched,
         variants_total=result.variants_total,
         match_rate=result.match_rate,
@@ -364,6 +371,254 @@ def _row_rank_key(row: TraitScoreRow) -> tuple[bool, bool, float, float]:
         bool(row.percentile_reliable),
         row.weight_mass_coverage if row.weight_mass_coverage is not None else -1.0,
         row.match_rate if row.match_rate is not None else -1.0,
+    )
+
+
+# Curation thresholds for profile="curated" (criteria, not a hard-coded ID list).
+_CURATE_MIN_VARIANTS = 10  # below this a score is a "toy" model — drop (F20/no-toy guard)
+_CURATE_MIN_WEIGHT_MASS_COVERAGE = 0.20  # just-prs MIN_RELIABLE_WEIGHT_MASS_COVERAGE (F20, C_wt)
+_NEEDS_EXTENDED_HINT = (
+    "Raw curation knobs (min_match_rate / min_auroc and the full granular filter "
+    "surface) are an extended-mode capability — relaunch with PRS_MCP_MODE=extended "
+    "(or --mode extended) for explicit PGS-ID batches, reference-panel scoring, and "
+    "raw match-rate / method tuning."
+)
+
+
+def _score_metadata_map(settings: Settings, pgs_ids: list[str]) -> dict[str, dict]:
+    """Look up cleaned catalog metadata for each PGS ID once (local cache reads).
+
+    Returns ``{pgs_id: row_dict}``; missing IDs are simply absent. Used to join
+    genome_build / n_variants / weight_type / pgp_id onto trait-report rows
+    without a per-score REST round-trip (F21).
+    """
+    cat = client.make_catalog(settings)
+    out: dict[str, dict] = {}
+    for pid in pgs_ids:
+        try:
+            row = cat.score_info_row(pid)
+        except Exception:  # noqa: BLE001 — metadata join is best-effort
+            row = None
+        if row is not None:
+            out[pid] = row
+    return out
+
+
+def _apply_curation(
+    rows: list[TraitScoreRow],
+    profile: str,
+    meta_by_id: dict[str, dict],
+    min_match_rate: float | None,
+    min_auroc: float | None,
+    build: str | None,
+    ancestry: str | None,
+) -> tuple[list[TraitScoreRow], int, str | None]:
+    """Filter scored rows by explicit thresholds and (for ``curated``) live criteria.
+
+    Returns ``(kept_rows, n_filtered, filter_summary)``. Failed rows are always kept
+    (they carry the error and feed trait-level counts) — only *scored* rows are
+    eligible for filtering. ``curated`` layers the no-toy-score, has-performance,
+    coverage-adequate, and score-family-dedup criteria on top of the explicit filters;
+    ``all`` applies only the explicit filters.
+    """
+    reasons: dict[str, int] = {}
+
+    def drop(reason: str) -> None:
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    kept: list[TraitScoreRow] = []
+    for row in rows:
+        if row.status != "scored":
+            kept.append(row)
+            continue
+        # Explicit filters (both profiles).
+        if min_match_rate is not None and (
+            row.match_rate is None or row.match_rate < min_match_rate
+        ):
+            drop("below min_match_rate")
+            continue
+        if min_auroc is not None and (row.auroc_estimate is None or row.auroc_estimate < min_auroc):
+            drop("below min_auroc / no AUROC")
+            continue
+        if build and (row.genome_build or "").upper() != build.upper():
+            drop("genome_build mismatch")
+            continue
+        if ancestry and (row.reference_panel_ancestry or "").upper() != ancestry.upper():
+            drop("ancestry mismatch")
+            continue
+        # Curated-only live criteria.
+        if profile == "curated":
+            if row.variants_number is not None and row.variants_number < _CURATE_MIN_VARIANTS:
+                drop("toy score (<10 variants)")
+                continue
+            if row.auroc_estimate is None and not row.effect_size:
+                drop("no performance evidence")
+                continue
+            if (
+                row.weight_mass_coverage is not None
+                and row.weight_mass_coverage < _CURATE_MIN_WEIGHT_MASS_COVERAGE
+            ):
+                drop("coverage below C_wt floor")
+                continue
+        kept.append(row)
+
+    # Score-family dedup (curated only): one best row per publication family.
+    if profile == "curated":
+        best_by_family: dict[str, TraitScoreRow] = {}
+        passthrough: list[TraitScoreRow] = []
+        for row in kept:
+            if row.status != "scored":
+                passthrough.append(row)
+                continue
+            family = (meta_by_id.get(row.pgs_id, {}) or {}).get("pgp_id")
+            if not family:
+                passthrough.append(row)
+                continue
+            incumbent = best_by_family.get(family)
+            if incumbent is None or _row_rank_key(row) > _row_rank_key(incumbent):
+                if incumbent is not None:
+                    drop("duplicate score family")
+                best_by_family[family] = row
+            else:
+                drop("duplicate score family")
+        kept = passthrough + list(best_by_family.values())
+
+    n_filtered = sum(reasons.values())
+    summary = None
+    if n_filtered:
+        parts = ", ".join(f"{n} {reason}" for reason, n in sorted(reasons.items()))
+        summary = f"profile={profile} dropped {n_filtered} scored row(s): {parts}"
+    return kept, n_filtered, summary
+
+
+# Quality tier -> Plotly marker base shape, mirroring prs-ui's bell-curve renderer
+# (prs-ui/prs_ui/mixin.py _quality_marker_shape). Reimplemented here (not imported)
+# since prs-ui is a separate Reflex app.
+_QUALITY_SHAPE_MAP = {
+    "high": "star",
+    "normal": "pentagon",
+    "moderate": "square",
+    "low": "triangle-up",
+}
+_BELL_GREEN = "#2e7d32"  # reliable, in average range
+_BELL_GREY = "#9e9e9e"  # extreme or low coverage
+_BELL_RED = "#c62828"  # outlier
+
+
+def _bell_marker(row: TraitScoreRow) -> tuple[str, str]:
+    """Plotly (symbol, hex_color) for a model marker — mirrors prs-ui _bell_curve_marker.
+
+    Outlier (≤2.5 / ≥97.5 pct) → open + red; reliable & in the 25–75 average range →
+    filled + green; everything else (extreme or unreliable/low-coverage) → dot + grey.
+    """
+    base = _QUALITY_SHAPE_MAP.get((row.quality_label or "").strip().lower(), "circle")
+    pct = row.percentile
+    if pct is not None and (pct <= 2.5 or pct >= 97.5):
+        return f"{base}-open", _BELL_RED
+    if row.percentile_reliable and pct is not None and 25.0 <= pct <= 75.0:
+        return base, _BELL_GREEN
+    return f"{base}-dot", _BELL_GREY
+
+
+def _trait_panel_figure(report: TraitPRSReport) -> tuple[dict, int]:
+    """Build a Plotly figure dict for a trait report; return (figure, n_markers).
+
+    A standard-normal reference curve with one marker per scored model placed at its
+    percentile (x) on the curve (y = normal pdf at that percentile's z). No plotting
+    library needed — only stdlib ``statistics.NormalDist``.
+    """
+    from statistics import NormalDist
+
+    nd = NormalDist()
+    # Reference bell curve sampled on the percentile axis (0–100).
+    curve_x = [i * 100 / 200 for i in range(201)]
+    curve_x = [min(99.9, max(0.1, x)) for x in curve_x]
+    curve_y = [nd.pdf(nd.inv_cdf(x / 100.0)) for x in curve_x]
+
+    xs: list[float] = []
+    ys: list[float] = []
+    symbols: list[str] = []
+    colors: list[str] = []
+    texts: list[str] = []
+    hovers: list[str] = []
+    for row in report.rows:
+        if row.status != "scored" or row.percentile is None:
+            continue
+        p = min(99.9, max(0.1, row.percentile))
+        symbol, color = _bell_marker(row)
+        xs.append(row.percentile)
+        ys.append(nd.pdf(nd.inv_cdf(p / 100.0)))
+        symbols.append(symbol)
+        colors.append(color)
+        texts.append(row.pgs_id)
+        cov = "" if row.weight_mass_coverage is None else f", C_wt={row.weight_mass_coverage:.0%}"
+        auroc = "" if row.auroc_estimate is None else f", AUROC={row.auroc_estimate:.2f}"
+        hovers.append(
+            f"{row.pgs_id}: {row.percentile:.0f}th pct"
+            f"{cov}{auroc} ({row.quality_label or 'quality n/a'})"
+        )
+
+    figure = {
+        "data": [
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "x": curve_x,
+                "y": curve_y,
+                "line": {"color": "#cccccc", "width": 1},
+                "name": "reference distribution",
+                "hoverinfo": "skip",
+            },
+            {
+                "type": "scatter",
+                "mode": "markers+text",
+                "x": xs,
+                "y": ys,
+                "marker": {"symbol": symbols, "color": colors, "size": 13, "line": {"width": 1}},
+                "text": texts,
+                "textposition": "top center",
+                "textfont": {"size": 9},
+                "hovertext": hovers,
+                "hoverinfo": "text",
+                "name": "models",
+            },
+        ],
+        "layout": {
+            "title": {"text": f"PRS panel — {report.label} ({report.trait_id})"},
+            "xaxis": {"title": {"text": "Population percentile"}, "range": [0, 100]},
+            "yaxis": {"title": {"text": "relative density"}, "showticklabels": False},
+            "showlegend": False,
+            "template": "plotly_white",
+            "annotations": [
+                {
+                    "text": "shape = quality tier · green=reliable/average · "
+                    "grey=extreme/low-coverage · red=outlier",
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0,
+                    "y": 1.08,
+                    "showarrow": False,
+                    "font": {"size": 10, "color": "#666"},
+                }
+            ],
+        },
+    }
+    return figure, len(xs)
+
+
+def _trait_panel_html(figure: dict, title: str) -> str:
+    """Wrap a Plotly figure dict in a minimal self-contained HTML page (CDN plotly.js)."""
+    import json
+
+    fig_json = json.dumps(figure)
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{title}</title>"
+        "<script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script></head>"
+        "<body><div id='chart' style='width:100%;height:100vh'></div>"
+        f"<script>const fig={fig_json};"
+        "Plotly.newPlot('chart',fig.data,fig.layout,{responsive:true});</script>"
+        "</body></html>"
     )
 
 
@@ -776,21 +1031,40 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         superpopulation: str = "EUR",
         panel: str | None = None,
         top_n: int | None = None,
+        profile: str = "curated",
+        min_match_rate: float | None = None,
+        min_auroc: float | None = None,
+        build: str | None = None,
+        ancestry: str | None = None,
     ) -> TraitPRSReport:
-        """Compute all directly associated PRS scores for a trait ontology ID.
+        """Compute the PRS scores associated with a trait ontology ID.
 
         ``trait_id`` may be an EFO or MONDO identifier. Set ``include_children``
         to also score PGS IDs associated through descendant traits. ``limit`` caps
         how many scores are *computed* and reports skipped IDs explicitly.
 
-        ``top_n`` caps how many per-score rows are *returned*: rows are ranked
+        **Profile (curation):** ``profile="curated"`` (default) returns an
+        interpreted *shortlist* — it applies live criteria (drops toy scores
+        <10 variants, scores with no performance evidence, scores below the C_wt
+        coverage floor, and de-dups score families to one best per publication) and
+        reports what it dropped in ``filter_summary`` / ``n_filtered``. Use
+        ``profile="all"`` for every associated score (the raw panel).
+
+        **Filters (apply in both profiles, before ``top_n``):** ``min_match_rate``,
+        ``min_auroc``, ``build`` (e.g. 'GRCh38'), and ``ancestry`` (matched against
+        each score's reference-panel ancestry). These raw knobs are the extended-mode
+        curation surface — using ``min_match_rate`` / ``min_auroc`` sets
+        ``needs_extended`` on the report as a breadcrumb.
+
+        ``top_n`` then caps how many surviving rows are *returned*: rows are ranked
         best-coverage first (scored before failed, reliable percentile before not,
-        higher match rate first) and the rest are trimmed, with ``n_omitted``
-        reporting the count. A big trait (100+ scores) with ``interpret=True`` can
-        otherwise exceed the client's output-token limit; trait-level counts and
-        ``mean_match_rate`` always reflect every score, so trimming is explicit,
+        higher C_wt then match rate) and the rest trimmed, with ``n_omitted``
+        reporting the count. Trait-level counts and ``mean_match_rate`` always
+        reflect every computed score, so both filtering and trimming are explicit,
         never silent.
         """
+        if profile not in ("curated", "all"):
+            raise ToolError("profile must be 'curated' or 'all'.")
         b = client.build(settings, genome_build)
         try:
             with client.make_rest_client() as rest:
@@ -824,6 +1098,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             _require_file(vcf_path, "VCF")
 
         rows: list[TraitScoreRow] = []
+        meta_by_id: dict[str, dict] = {}
         detected_genome_build: str | None = None
         build_mismatch = False
         try:
@@ -838,6 +1113,9 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             )
             by_id = {result.pgs_id: result for result in batch.results}
             errors = {o.pgs_id: o.error for o in batch.outcomes if o.status != "ok"}
+            # Join catalog metadata (genome_build / n_variants / weight_type / pgp_id)
+            # once for the F21 columns + curation, off the event loop (F21).
+            meta_by_id = await run_sync(lambda: _score_metadata_map(settings, selected_ids))
             for pgs_id in selected_ids:
                 result = by_id.get(pgs_id)
                 if result is None:
@@ -861,6 +1139,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                         interpret=interpret,
                         superpopulation=superpopulation,
                         panel=panel,
+                        meta=meta_by_id.get(pgs_id),
                     )
                 )
             await ctx.report_progress(progress=len(selected_ids), total=max(1, len(selected_ids)))
@@ -870,15 +1149,28 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
                 for pgs_id in selected_ids
             ]
 
+        # Trait-level counts reflect EVERY computed score (before curation/trim).
         n_scored = sum(1 for row in rows if row.status == "scored")
         n_failed = sum(1 for row in rows if row.status == "failed")
         n_reliable = sum(1 for row in rows if row.percentile_reliable)
         match_rates = [row.match_rate for row in rows if row.match_rate is not None]
         mean_match_rate = sum(match_rates) / len(match_rates) if match_rates else None
 
-        ranked = sorted(rows, key=_row_rank_key, reverse=True)
+        # Curation + explicit filters (F21), then rank, then top_n trim — each step
+        # explicit and reported, never silent.
+        curated_rows, n_filtered, filter_summary = _apply_curation(
+            rows,
+            profile=profile,
+            meta_by_id=meta_by_id,
+            min_match_rate=min_match_rate,
+            min_auroc=min_auroc,
+            build=build,
+            ancestry=ancestry,
+        )
+        ranked = sorted(curated_rows, key=_row_rank_key, reverse=True)
         returned = ranked if top_n is None else ranked[: max(0, top_n)]
-        n_omitted = len(rows) - len(returned)
+        n_omitted = len(curated_rows) - len(returned)
+        needs_extended = min_match_rate is not None or min_auroc is not None
 
         summary = (
             f"Scored {n_scored}/{len(selected_ids)} PGS ID(s) for {trait.label or trait.id} "
@@ -886,6 +1178,8 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         )
         if mean_match_rate is not None:
             summary += f"; mean coverage {mean_match_rate:.0%}, {n_reliable} reliable percentile(s)"
+        if filter_summary:
+            summary += f"; {filter_summary}"
         if n_omitted:
             summary += f"; {n_omitted} row(s) trimmed from response by top_n={top_n}"
         if build_mismatch:
@@ -909,6 +1203,11 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             mean_match_rate=mean_match_rate,
             n_returned=len(returned),
             n_omitted=n_omitted,
+            profile=profile,
+            n_filtered=n_filtered,
+            filter_summary=filter_summary,
+            needs_extended=needs_extended,
+            needs_extended_hint=_NEEDS_EXTENDED_HINT if needs_extended else None,
             rows=returned,
             summary=summary + ".",
             genome_label=genome_label,
@@ -1171,6 +1470,45 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             summary=" ".join(summary_parts),
         )
 
+    @mcp.tool(
+        annotations=ToolAnnotations(title="Plot trait panel", readOnlyHint=True),
+    )
+    def plot_trait_panel(result_path: str, include_html: bool = False) -> TraitPanelPlot:
+        """Build a Plotly figure spec for a saved by-trait PRS report.
+
+        Pass the ``result_path`` from a ``compute_prs_by_trait`` result (the report
+        is auto-saved as JSON). Returns a Plotly figure ({data, layout}) — NOT a
+        server-rendered image — placing one marker per scored model on a reference
+        normal curve at its percentile: marker shape encodes the model's quality
+        tier and color encodes reliability/outlier status. The client renders it
+        (Plotly.newPlot, plotly.io.from_json, or the optional ``html`` page). Set
+        ``include_html=True`` to also get a self-contained HTML page (loads
+        plotly.js from CDN) you can save and open in a browser.
+        """
+        path = _require_file(result_path, "Trait report JSON")
+        try:
+            report = TraitPRSReport.model_validate_json(path.read_text())
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"Could not parse a trait report from {result_path}: {exc}") from exc
+
+        figure, n_markers = _trait_panel_figure(report)
+        title = f"PRS panel — {report.label} ({report.trait_id})"
+        html = _trait_panel_html(figure, title) if include_html else None
+        summary = (
+            f"Plotly panel for {report.label} ({report.trait_id}): {n_markers} model "
+            f"marker(s) on the reference curve"
+        )
+        if n_markers == 0:
+            summary += " — no scored model had a percentile to plot (compute with interpret=True)"
+        return TraitPanelPlot(
+            trait_id=report.trait_id,
+            label=report.label,
+            figure=figure,
+            n_markers=n_markers,
+            html=html,
+            summary=summary + ".",
+        )
+
     @mcp.resource("resource://prs/panels")
     def panels() -> str:
         """Reference panels, supported genome builds, and the active cache directory."""
@@ -1208,6 +1546,44 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
             f"{vcf_path}. Search the PGS Catalog for relevant scores, normalize the "
             "VCF, compute the PRS for the most relevant score(s), and interpret the "
             "results (percentile and quality)."
+        )
+
+    @mcp.prompt
+    def interpret_prs_for_trait(trait: str, vcf_path: str = "<path/to/sample.vcf.gz>") -> str:
+        """Prompt template: the end-to-end methodology for an interpretable by-trait PRS read.
+
+        Encodes the 5-stage recipe (resolve → confirm ancestry → curated by-trait →
+        read shortlist concordance → caveats) so every client gets the methodology,
+        not just agents with it in local context (dogfooding F21).
+        """
+        return (
+            f"Produce an interpretable polygenic-risk read for '{trait}' from the VCF "
+            f"at {vcf_path}. A raw by-trait panel can be 100+ scores spanning the full "
+            "0–100 percentile range — your job is to trim it to a trustworthy shortlist "
+            "and report the consensus, not to dump every score. Follow this method:\n\n"
+            "1. **Resolve the trait.** Use `search_traits` / `trait_info` to get the "
+            "ontology ID (EFO or MONDO). If several traits match, confirm which one.\n"
+            "2. **Confirm ancestry.** The percentile is only meaningful when the "
+            "reference panel matches the person's genetic ancestry. Ask the user their "
+            "ancestry (or note the default EUR assumption) and pass it as "
+            "`superpopulation`. Flag, don't hide, an ancestry mismatch.\n"
+            "3. **Curated by-trait computation.** Call `compute_prs_by_trait(trait_id, "
+            "vcf_path, interpret=True, profile='curated', superpopulation=<ancestry>)`. "
+            "The curated profile already drops toy scores, no-performance-evidence "
+            "scores, and low-C_wt-coverage scores, and de-dups score families — read "
+            "`filter_summary` / `n_filtered` so you can tell the user what was excluded "
+            "and why. (Use `profile='all'` only if explicitly asked for the raw panel.)\n"
+            "4. **Read the shortlist concordance.** Look at whether the surviving "
+            "high-quality models AGREE on the percentile, not just the single best one. "
+            "Note `weight_mass_coverage` (C_wt) and `percentile_reliable` — a tight "
+            "cluster of reliable models is a strong read; a wide spread is weak.\n"
+            "5. **State caveats.** Be explicit about coverage, ancestry match, model "
+            "quality tier, and that a PRS is one predisposition factor among many "
+            "(lifestyle, environment, other genetics) — not a diagnosis. For disease "
+            "traits with a z-score, call `absolute_risk` to translate the percentile "
+            "into a concrete lifetime probability.\n\n"
+            "Then summarize for a citizen scientist (you may use the "
+            "`interpret_trait_results` prompt for the write-up structure)."
         )
 
     @mcp.prompt

@@ -12,101 +12,42 @@ server end-to-end. As findings are resolved they move to
 `docs/previous_issues.md` (with resolution + code pointer); findings that need an
 upstream **just-prs library** change live in `docs/just-prs-pending-fixes.md`.
 
-## Where things stand (last sweep 2026-06-21)
+## Where things stand (last sweep 2026-06-23)
 
 - **Resolved in the wrapper → `docs/previous_issues.md`:** F1, F3, F5, F6, F7,
   F8, F14, plus the wrapper-side mitigations for F2, F4, F9, F10, F11. F13 is
-  closed (tested & disproven).
+  closed (tested & disproven). **F21** (filterable trait report + curated
+  profile + `interpret_prs_for_trait` prompt + `prs-trait-interpretation`
+  skill), **F23** (mode-gate visibility + `needs_extended` breadcrumb), and
+  **F27** (Plotly-JSON `plot_trait_panel`) were resolved in the wrapper on
+  2026-06-23 — see `docs/previous_issues.md`.
 - **Open, upstream-blocked → `docs/just-prs-pending-fixes.md`:** the library
   remainder of F2, F4, F9, F10, F11; the F15 coverage root cause (F18 ruled out
   build, **F22 is the leading lead — unexpanded gVCF ref blocks**); F19
-  (ancestry), F12.
-- **Open, wrapper-actionable (below):** F21 (filterable trait report + the
-  essentials/extended curation-profile design), F23 (mode-gate visibility +
-  switch-to-extended signal), and the proposed `interpret_prs_for_trait` MCP
-  prompt / `prs-trait-interpretation` skill.
+  (ancestry), F12; the F19/F21 column slice (development ancestry, dev sample
+  size, `is_harmonized` — not in the cleaned scores sheet); and the F27
+  empirical-distribution exposure (per-individual reference scores).
+- **Declined (not planned):** F24 (remote VCF ingest) — see below.
 
-These came out of a second dogfooding pass: *"how do we trim a 220-score trait
-panel down to an interpretable read?"* The headline lesson — coverage/build
-filters are necessary but not sufficient; the gates that actually matter
-(ancestry, model quality, coverage-relative-to-score-size) aren't expressible in
-the tool today.
-
----
-
-## F21 — Trait report isn't filterable; the axes that matter aren't columns *(open / wrapper-actionable)*
-
-To trim `compute_prs_by_trait`'s 220 rows to an interpretable shortlist you must
-filter on per-score attributes the report doesn't carry — so today an agent has
-to call `score_info`/`best_performance` ~220× and join by hand.
-
-- **Add columns to `TraitScoreRow`:** `genome_build`, development ancestry,
-  `variants_number`, `weight_type`, and development sample size. (`auroc_estimate`
-  is already joined when `interpret=True` — extend that join.)
-- **Add filter/rank params to `compute_prs_by_trait`:** `min_match_rate`,
-  `min_auroc`, `ancestry`, `build` — today only `top_n` exists, which trims but
-  cannot *select*.
-- **`score_info` returns `variants_number: null` and `is_harmonized: null`** — the
-  exact fields you'd filter on are empty. Parse them from catalog metadata.
-
-Why it matters: the empirically-correct trimming recipe (see F18/F19/F20) is
-ancestry → model-quality → coverage-relative-to-score-type → family-dedup →
-report-the-consensus. **None of those gates is expressible against the current
-report.** A `top_n` cap is not a filter.
-
-### Curation design — essentials vs extended (persona: essentials = non-bioinformatician)
-
-Decision from the design pass: **do not hard-code curated per-trait PGS lists** in
-just-prs (the right score is ancestry-dependent, the catalog grows monthly, and
-anointing winners is a liability the PGS Catalog itself avoids). Instead **curate
-by criteria, computed live**, and split by mode:
-
-- **Essentials** returns a curated, interpreted *shortlist* by default — not 220
-  raw rows. `compute_prs_by_trait(trait, vcf, ancestry, profile="curated"|"all")`.
-  The default `curated` profile applies, with good defaults and a report of what
-  it dropped: ancestry-match (dev ancestry + reference panel keyed to the user's
-  ancestry), has-performance-evidence, coverage-adequate-for-score-type (F20),
-  score-family dedup, and a no-toy-score guard. Layperson-meaningful knobs only
-  (ancestry; profile).
-- **Extended** exposes the granular curation surface: explicit PGS-ID lists /
-  arbitrary batch (`compute_prs_batch`), `min_match_rate`, `min_auroc`,
-  include-preprints, build/weight_type/method overrides, reference-panel & pgen
-  scoring, bulk download / HF, and an optional *frozen, versioned* curated set for
-  reproducibility/benchmarking.
-
-The curated thing is the **criteria**, not the IDs. This is the same column/filter
-work as F21's bullets above (ancestry is F19) — just packaged as a default profile
-in essentials and as raw knobs in extended.
-
-### Proposed `interpret_prs_for_trait` MCP prompt + `prs-trait-interpretation` skill
-
-The 5-stage recipe lives only in agent context per-run. Ship the methodology as a
-**server-side MCP prompt** (alongside the existing `compute_prs_for_trait`) so
-*every* client gets it, not just Claude: resolve trait → confirm ancestry →
-curated by-trait → read shortlist concordance → state caveats. The Claude skill
-(`prs-trait-interpretation`) becomes a thin wrapper over the prompt. This is the
-docs/methodology gap the dogfooding flagged.
+The 2026-06-23 wrapper pass closed the *expressible-filtering* gap: the by-trait
+report now carries the metadata columns, the curated profile trims by live
+criteria, and the methodology ships as a prompt + skill. The remaining gates that
+need library data — development ancestry, the coverage root cause, the empirical
+reference distribution — stay upstream.
 
 ---
 
-## F23 — Agent can't see the mode gate; no signal for when to switch to extended *(open / wrapper-actionable)*
+## F24 — Remote server can't ingest a client-local VCF *(DECLINED — not planned, 2026-06-23)*
 
-The agent only discovers a capability is extended-gated by the tool's **absence**
-— there's no up-front map of what's behind the gate or trigger to ask the user to
-switch. Fix is threefold:
-
-- **Server `instructions`** should crisply enumerate extended-only capabilities
-  (the partial list exists; make it a clear "switch to extended for: …").
-- **Essentials tools emit a `needs_extended` breadcrumb** in structured output
-  when a request bumps the gate (e.g. user asks for specific PGS IDs, raw
-  match-rate tuning, reference-panel scoring, or to override curation) — naming
-  the env/CLI switch (`PRS_MCP_MODE=extended` / `--mode extended`).
-- **AGENTS.md** keeps the mode→tool map for coding agents.
-
-Switch-to-extended triggers: specific PGS-ID list / arbitrary batch;
-reference-panel or pgen scoring; overriding curation (preprints, non-ancestry-
-matched, toy scores); bulk catalog download / HF upload; raw match-rate/method
-tuning.
+**Decision:** we will **not** build a client→server VCF upload or fetch-URL path.
+Persisting a user's personal genomic/medical data on a remote/hosted server is a
+privacy and compliance liability we decline to take on. A user with their own
+genome should run the server **locally** (stdio) against their own filesystem; on
+a hosted server the only ingest path remains `download_sample_genome` (public
+Zenodo sample WGS). The server `instructions` now state this plainly so a remote
+user's first compute call doesn't fail confusingly with "VCF not found"
+(`server.py`). Left here (not moved to `previous_issues.md`) because it is a
+deliberate non-fix, not a resolution.
 
 ---
 
@@ -168,13 +109,19 @@ cached sample) and **F26** (cached genomes not exposed as an MCP resource) are n
 `.part` write; F26: `resource://prs/genomes` (JSON) backed by a shared
 `_scan_genome_catalog` helper.
 
-## F27 — No plotting / visualization tool exposed by MCP *(open / design question)*
+## F27 — No plotting / visualization tool exposed by MCP *(wrapper resolved 2026-06-23; richer chart upstream)*
 
-Producing the requested PNG graph of the trait panel has no server-side tool —
-the MCP surface is data-only (search/compute/interpret). Plotting therefore falls
-back to the client (matplotlib here). Worth deciding deliberately: either (a) keep
-viz client-side and document a canonical recipe / ship it in the
-`prs-trait-interpretation` skill, or (b) add a `plot_trait_panel` /
-`plot_prs_distribution` tool that returns a PNG (image content block) or an SVG
-resource. For a hosted server, server-side rendering is the only way non-coding
-clients get a chart at all.
+**Resolved in the wrapper → `docs/previous_issues.md`.** Decision: emit a **Plotly
+figure spec (JSON)** the client renders, not a server-rendered PNG — more flexible
+(client can restyle / rasterize / drop into HTML+JS) and no heavy render
+dependency on the server. `plot_trait_panel(result_path, include_html=False)`
+returns a `TraitPanelPlot` (theoretical normal curve + one marker per scored model
+at its percentile; shape = quality tier, color = reliability/outlier — mirroring
+prs-ui's `bell_curve`), plus an optional self-contained HTML page.
+
+**Upstream remainder → `docs/just-prs-pending-fixes.md` F27:** the richer chart — a
+histogram of the 2,504 1000G reference individuals with the user's score marked —
+needs `just-prs` to expose per-individual reference scores
+(`reference_individual_scores(...)`); today only aggregated summary stats are
+public. That doc also carries the prs-ui consumption recommendation so both
+surfaces stay fed from one accessor.
