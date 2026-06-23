@@ -410,6 +410,7 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         min_qual: float | None = None,
         sex: str | None = None,
         genome_build: str | None = None,
+        force: bool = False,
     ) -> NormalizeResult:
         """Normalize a VCF to a quality-filtered genotype Parquet (background task).
 
@@ -418,6 +419,12 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         zstd-compressed Parquet. The output is a drop-in genotype source for
         ``compute_prs`` / ``compute_prs_batch`` (pass it as ``genotypes_path``),
         so a VCF is normalized once and reused across many scores.
+
+        Idempotent: if the target Parquet already exists it is reused and the
+        (slow) normalization is skipped — ``reused_cache=True`` flags the hit.
+        Custom filters (``pass_filters`` / ``min_depth`` / ``min_qual`` / ``sex``)
+        always re-run, since the cached Parquet may not reflect them. Pass
+        ``force=True`` to re-normalize unconditionally.
 
         Runs as a real MCP background task, though some clients transparently
         collapse the task/poll handshake and return the final result inline.
@@ -441,6 +448,21 @@ def register_compute(mcp: FastMCP, settings: Settings) -> None:
         if any(v is not None for v in (pass_filters, min_depth, min_qual, sex)):
             config = VcfFilterConfig(
                 pass_filters=pass_filters, min_depth=min_depth, min_qual=min_qual, sex=sex
+            )
+
+        # Idempotent cache hit: an existing Parquet is reused unless the caller forced
+        # it or asked for custom filters (which the cached file may not reflect).
+        if out.exists() and not force and config is None:
+            n = await run_sync(lambda: _count_rows(out))
+            log.info("Reused cached Parquet %s (%d variants)", out, n)
+            return NormalizeResult(
+                output_path=str(out),
+                n_variants=n,
+                genome_build=b,
+                reused_cache=True,
+                message=(
+                    f"Reused cached Parquet {out} ({n} variants). Pass force=True to re-normalize."
+                ),
             )
 
         await ctx.info(f"Normalizing {src.name} -> {out.name}")

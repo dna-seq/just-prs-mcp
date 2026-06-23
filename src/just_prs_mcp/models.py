@@ -84,6 +84,10 @@ class NormalizeResult(BaseModel):
         default=None,
         description="Effective genome build assumed for downstream scoring.",
     )
+    reused_cache: bool = Field(
+        default=False,
+        description="True if an existing Parquet was reused instead of re-normalizing.",
+    )
     message: str = Field(description="Human-readable summary.")
 
 

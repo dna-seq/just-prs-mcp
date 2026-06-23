@@ -521,12 +521,66 @@ async def test_download_sample_genome_idempotent(tmp_path, monkeypatch):
         assert counter["downloads"] == 1
 
         forced = (
-            await client.call_tool(
-                "download_sample_genome", {"sample": "anton", "force": True}
-            )
+            await client.call_tool("download_sample_genome", {"sample": "anton", "force": True})
         ).data
         assert forced.data["reused_cache"] is False
         assert counter["downloads"] == 2
+
+
+# --- F28: normalize_vcf is idempotent (reuses an existing Parquet) ---
+
+
+async def test_normalize_vcf_idempotent(tmp_path, monkeypatch):
+    """An existing Parquet is reused; force and custom filters re-normalize (F28)."""
+    import just_prs.normalize as jn
+    from fastmcp.client import Client
+
+    from just_prs_mcp.server import build_server
+    from just_prs_mcp.settings import Settings
+    from just_prs_mcp.tools import compute as compute_mod
+
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    vcf = samples / "antonkulaga.vcf"
+    vcf.write_bytes(b"##fileformat=VCFv4.2\n")
+    norm_dir = tmp_path / "normalized"
+    norm_dir.mkdir()
+    (norm_dir / "antonkulaga.parquet").write_bytes(b"cached parquet")
+
+    calls = {"normalize": 0}
+
+    def _fake_normalize(src, out, config=None):
+        calls["normalize"] += 1
+        from pathlib import Path
+
+        Path(out).write_bytes(b"fresh parquet")
+        return Path(out)
+
+    monkeypatch.setattr(jn, "normalize_vcf", _fake_normalize)
+    monkeypatch.setattr(compute_mod, "_count_rows", lambda p: 42)
+
+    settings = Settings(cache_dir=str(tmp_path))
+    server = build_server(mode="essentials", settings=settings)
+    async with Client(transport=server) as client:
+        # Cache hit — no re-normalization.
+        first = (await client.call_tool("normalize_vcf", {"vcf_path": str(vcf)})).data
+        assert first.reused_cache is True
+        assert first.n_variants == 42
+        assert calls["normalize"] == 0
+
+        # force=True re-normalizes.
+        forced = (
+            await client.call_tool("normalize_vcf", {"vcf_path": str(vcf), "force": True})
+        ).data
+        assert forced.reused_cache is False
+        assert calls["normalize"] == 1
+
+        # Custom filters bypass the cache (cached Parquet may not reflect them).
+        filtered = (
+            await client.call_tool("normalize_vcf", {"vcf_path": str(vcf), "min_depth": 10})
+        ).data
+        assert filtered.reused_cache is False
+        assert calls["normalize"] == 2
 
 
 class FakePrevalenceCatalog:

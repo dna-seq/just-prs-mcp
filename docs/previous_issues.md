@@ -261,3 +261,16 @@ exactly one way. `tools/compute.py` (`_scan_genome_catalog`, `genomes` resource,
 `test_genomes_resource_mirrors_list_genomes`. The per-genome templated URI
 (`resource://prs/genomes/{alias}`) noted as a "bonus" in the finding was not added — the
 single-resource inventory covers discovery.
+
+## F28 — `normalize_vcf` is now idempotent *(resolved)*
+
+Sibling of F25, found while pre-staging genomes on prod: the standalone `normalize_vcf`
+tool was annotated `idempotentHint=True` but re-ran the (slow) normalization and
+overwrote the Parquet even when the target already existed — re-normalizing anton's
+6.08 M variants on a second call. Now: if the target Parquet exists, it's reused and
+normalization is skipped, with `reused_cache=True` on the `NormalizeResult` and a "Reused
+cached …" message. A new `force=False` re-normalizes unconditionally. Custom filters
+(`pass_filters` / `min_depth` / `min_qual` / `sex`) always re-run, since the cached
+Parquet may not reflect them and the wrapper keeps no record of what produced it.
+`tools/compute.py` (`normalize_vcf`); `NormalizeResult.reused_cache` added in `models.py`.
+Verified by `test_normalize_vcf_idempotent`.
