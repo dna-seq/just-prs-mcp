@@ -177,3 +177,26 @@ single `F#` may appear in two files (wrapper-resolved *and* its upstream remaind
 - **Reference / pgen**: `uv sync --extra reference` (pgenlib; Linux/WSL only).
 - **Smithery deploy**: `uv sync --extra smithery` (see `pyproject.toml`
   `[tool.smithery]` and `smithery.yaml`).
+
+## Cursor Cloud specific instructions
+
+Deps are pre-installed by the startup update script (`uv sync --extra reference`),
+so the `.venv` and the optional `reference`/pgen tools are ready — just use the
+`uv run ...` commands already documented above. `uv` is installed to
+`~/.local/bin` (on PATH for login shells). The project pins `requires-python >=3.13`
+and `uv` provisions its own interpreter (currently CPython 3.14) — system `python3`
+is 3.12, so **always go through `uv run`**, never the system Python.
+
+- **Tests/lint/type-check are network-free and fast** (`uv run pytest`, etc.);
+  they cover MCP wiring only, not just-prs correctness (see "Testing notes").
+- **Running the server actually hits the network.** The first real tool call
+  (e.g. `search_scores`) downloads PGS Catalog metadata from HuggingFace / EBI
+  into the cache, so the first invocation is slower and emits an unauthenticated
+  HF-rate-limit warning (harmless; set `HF_TOKEN`/`PRS_MCP_HF_TOKEN` to silence).
+- **Smoke-testing the running server:** start it with
+  `PRS_MCP_MODE=extended uv run just-prs-mcp http --host 127.0.0.1 --port 3011`,
+  then connect with an in-process `fastmcp.Client("http://127.0.0.1:3011/mcp")`
+  and call a tool. A raw `GET /mcp` returns HTTP 406 by design (streamable-HTTP
+  needs the MCP handshake headers) — use the MCP client, not plain `curl`, to
+  verify. The fastest network-free check is the in-memory harness in `tests/`
+  (`Client(transport=build_server(...))`).
