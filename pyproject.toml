@@ -1,6 +1,6 @@
 [project]
 name = "just-prs-mcp"
-version = "0.1.2"
+version = "0.1.3"
 description = "An MCP server wrapping just-prs — PGS Catalog search and polygenic risk score computation"
 readme = "README.md"
 requires-python = ">=3.13"
